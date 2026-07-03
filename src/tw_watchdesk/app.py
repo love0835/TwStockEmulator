@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from tw_watchdesk.config import app_base_dir, load_settings, nova_settings_file, save_app_settings, save_nova_settings, settings_search_dirs
 from tw_watchdesk.models import WatchState
 from tw_watchdesk.nova import create_provider
+from tw_watchdesk.redaction import redact_text
 from tw_watchdesk.storage import DAYTRADE_ACCOUNT, SWING_ACCOUNT, TradingStore, default_db_path
 from tw_watchdesk.strategy import build_watch_state
 from tw_watchdesk.strategy_versions import FOLLOW_LATEST, MANUAL_LOCK, daytrade_params_from_json, swing_params_from_json
@@ -1503,7 +1504,7 @@ def _write_error(exc: BaseException) -> None:
     base = app_base_dir()
     target = base / "data" / "desktop-error.log"
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), encoding="utf-8")
+    target.write_text(redact_text("".join(traceback.format_exception(type(exc), exc, exc.__traceback__))), encoding="utf-8")
 
 
 def main() -> None:
