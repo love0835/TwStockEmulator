@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from tw_watchdesk.nova import _marketdata_rest_stock_client, _marketdata_stock_client, parse_aggregates_message
+from tw_watchdesk.nova import _marketdata_rest_stock_client, _marketdata_stock_client, parse_aggregates_message, parse_realtime_market_event
 
 
 def test_parse_aggregates_message() -> None:
@@ -55,6 +55,34 @@ def test_parse_book_ignores_zero_or_invalid_depth_prices() -> None:
     assert quote.ask_levels[0].price == 1000
     assert quote.flags["missing_bids"] is True
     assert quote.flags["invalid_depth_price"] is True
+
+
+def test_parse_realtime_market_event_trade() -> None:
+    event = parse_realtime_market_event(
+        {
+            "event": "data",
+            "channel": "trades",
+            "data": {
+                "symbol": "2330",
+                "price": 568,
+                "size": 4778,
+                "volume": 54538,
+                "time": 1685338200000000,
+                "serial": 6652422,
+            },
+        }
+    )
+
+    assert event is not None
+    assert event.channel == "trades"
+    assert event.symbol == "2330"
+    assert event.payload["serial"] == 6652422
+
+
+def test_parse_realtime_market_event_ignores_control_message() -> None:
+    event = parse_realtime_market_event({"event": "subscribed", "data": {"channel": "trades", "symbol": "2330"}})
+
+    assert event is None
 
 
 def test_marketdata_stock_client_prefers_realtime_stock() -> None:

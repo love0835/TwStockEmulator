@@ -194,5 +194,9 @@ def mark_filled(store: TradingStore, order: OrderRecord, fill_price: float, fill
         stop_loss=order.stop_loss,
         take_profit=order.take_profit,
         strategy_version=order.strategy_version,
+        candidate_id=order.candidate_id,
+        entry_order_id=order.id if order.side == "buy" else order.entry_order_id,
+        scout_version=order.scout_version,
+        attribution_status=order.attribution_status,
         at=filled_at,
     )

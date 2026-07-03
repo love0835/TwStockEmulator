@@ -108,12 +108,14 @@ class EvidenceBuilder:
                 for row in self.store.list_quote_diagnostics()
                 if _date_in_window(str(row["trade_date"]), start_date, end_date)
             ],
+            "market_data_coverage": self.store.market_data_coverage(start_date, end_date),
             "daily_reviews": [
                 dict(row)
                 for row in self.store.list_daily_reviews(limit=500)
                 if _date_in_window(str(row["review_date"]), start_date, end_date)
             ],
         }
+        evidence["attribution_summary"] = _attribution_summary(evidence)
         safe_evidence = redact_json(_jsonable(evidence))
         evidence_hash = stable_hash(safe_evidence)
         evidence_id = self.store.insert_review_evidence(
@@ -608,7 +610,45 @@ def _evidence_summary(evidence: dict[str, Any]) -> dict[str, Any]:
             "monitor_events": len(evidence.get("monitor_events", [])),
             "quote_diagnostics": len(evidence.get("quote_diagnostics", [])),
         },
+        "market_data_coverage": evidence.get("market_data_coverage", {}),
+        "attribution_summary": evidence.get("attribution_summary", {}),
         "strategies": evidence["strategies"],
+    }
+
+
+def _attribution_summary(evidence: dict[str, Any]) -> dict[str, Any]:
+    candidates = [row for row in evidence.get("candidates", []) if isinstance(row, dict)]
+    orders = [row for row in evidence.get("orders", []) if isinstance(row, dict)]
+    fills = [row for row in evidence.get("fills", []) if isinstance(row, dict)]
+    positions = [row for row in evidence.get("positions", []) if isinstance(row, dict)]
+    return {
+        "candidates": {
+            "total": len(candidates),
+            "auto_scout_missing_scout_version": sum(1 for row in candidates if row.get("source") == "auto_scout" and not row.get("scout_version")),
+        },
+        "orders": _attribution_counts(orders),
+        "fills": _attribution_counts(fills),
+        "positions": _attribution_counts(positions),
+    }
+
+
+def _attribution_counts(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    status_counts: dict[str, int] = {}
+    for row in rows:
+        status = str(row.get("attribution_status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    sell_rows = [row for row in rows if str(row.get("side", "")) == "sell"]
+    return {
+        "total": len(rows),
+        "status_counts": dict(sorted(status_counts.items())),
+        "missing_strategy_version": sum(1 for row in rows if not row.get("strategy_version")),
+        "missing_candidate_id": sum(1 for row in rows if row.get("candidate_id") in {None, ""}),
+        "missing_entry_order_id_on_sells": sum(1 for row in sell_rows if row.get("entry_order_id") in {None, ""}),
+        "auto_scout_missing_scout_version": sum(
+            1
+            for row in rows
+            if row.get("candidate_source") == "auto_scout" and not row.get("scout_version")
+        ),
     }
 
 

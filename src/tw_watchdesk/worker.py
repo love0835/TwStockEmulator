@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
+import queue
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -17,8 +19,8 @@ from tw_watchdesk.llm import (
     daily_review_schema,
     swing_strategy_review_schema,
 )
-from tw_watchdesk.models import Quote
-from tw_watchdesk.nova import ProviderUnavailable, QuoteProvider
+from tw_watchdesk.models import Quote, RealtimeMarketEvent
+from tw_watchdesk.nova import ProviderUnavailable, QuoteProvider, parse_aggregates_message
 from tw_watchdesk.quote_diagnostics import diagnose_quote_quality
 from tw_watchdesk.review import MultiAgentReviewOrchestrator
 from tw_watchdesk.scout import NovaRestScoutDataProvider, ScoutDataError, ScoutPick, select_candidates
@@ -82,6 +84,13 @@ class TradingLabWorker:
         self.last_daytrade_flatten_date: str | None = None
         self.last_candidate_expiry_date: str | None = None
         self.last_closed_date: str | None = None
+        self._realtime_capture_listener_registered = False
+        self._realtime_capture_symbols: set[str] = set()
+        self._realtime_capture_unavailable_logged = False
+        self._realtime_capture_error_keys: set[str] = set()
+        self._realtime_capture_queue: queue.Queue[RealtimeMarketEvent] = queue.Queue(maxsize=50_000)
+        self._realtime_capture_thread: threading.Thread | None = None
+        self._realtime_capture_dropped = 0
         self._status_lock = threading.RLock()
         self._status = WorkerStatus(
             running=False,
@@ -102,11 +111,14 @@ class TradingLabWorker:
         self.stop_event.clear()
         self._set_status("system", "starting", "交易實驗室啟動中")
         self._log_event("system", "starting", "worker_started", "交易實驗室啟動", created_at=datetime.now(timezone.utc))
+        self._start_realtime_capture_drain()
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
     def stop(self) -> None:
         self.stop_event.set()
+        if self._realtime_capture_thread and self._realtime_capture_thread.is_alive():
+            self._realtime_capture_thread.join(timeout=2.0)
         self._set_status("system", "stopped", "交易實驗室已停止", running=False)
         self._log_event("system", "stopped", "worker_stopped", "交易實驗室停止", created_at=datetime.now(timezone.utc))
 
@@ -156,6 +168,7 @@ class TradingLabWorker:
         if local.time() >= _auto_scout_time(self.settings.auto_scout_time) and self.last_scout_date != trade_date:
             self._run_scout(trade_date, now, manual=False)
             self.last_scout_date = trade_date
+        self._refresh_realtime_capture_subscriptions(now)
         window = session_window(now, self.settings.timezone)
         if (window.can_open_daytrade or window.daytrade_exit_only) and local.minute % 5 == 0:
             key = local.strftime("%Y-%m-%d %H:%M")
@@ -335,6 +348,191 @@ class TradingLabWorker:
         )
         return f"{trade_date} 多 Agent 策略檢討完成：{result.summary}"
 
+    def _refresh_realtime_capture_subscriptions(self, now: datetime) -> None:
+        if not self.settings.enable_realtime_capture or self.settings.market_data_mode != "live":
+            return
+        add_listener = getattr(self.provider, "add_market_data_listener", None)
+        subscribe = getattr(self.provider, "subscribe_market_data", None)
+        if not callable(add_listener) or not callable(subscribe):
+            if not self._realtime_capture_unavailable_logged:
+                self._log_event(
+                    "market_data",
+                    "realtime_capture",
+                    "realtime_capture_unavailable",
+                    "盤中行情落地不可用",
+                    detail="目前 provider 不支援 realtime capture listener/subscribe_market_data。",
+                    severity="warning",
+                    created_at=now,
+                    trade_date=now.astimezone(ZoneInfo(self.settings.timezone)).date().isoformat(),
+                )
+                self._realtime_capture_unavailable_logged = True
+            return
+        if not self._realtime_capture_listener_registered:
+            add_listener(self._handle_realtime_market_event)
+            self._realtime_capture_listener_registered = True
+        symbols = self._realtime_capture_target_symbols(now)
+        new_symbols = [symbol for symbol in symbols if symbol not in self._realtime_capture_symbols]
+        if not new_symbols:
+            return
+        channels = tuple(channel for channel in self.settings.realtime_capture_channels if channel)
+        if not channels:
+            return
+        try:
+            subscribe(new_symbols, channels)
+        except ProviderUnavailable as exc:
+            self._log_event(
+                "market_data",
+                "realtime_capture",
+                "realtime_capture_subscribe_failed",
+                "盤中行情訂閱失敗",
+                detail=str(exc),
+                severity="warning",
+                created_at=now,
+                trade_date=now.astimezone(ZoneInfo(self.settings.timezone)).date().isoformat(),
+                metrics={"symbols": new_symbols, "channels": channels},
+            )
+            return
+        self._realtime_capture_symbols.update(new_symbols)
+        self._log_event(
+            "market_data",
+            "realtime_capture",
+            "realtime_capture_subscribed",
+            "盤中行情落地訂閱",
+            detail=f"新增訂閱 {len(new_symbols)} 檔：{', '.join(new_symbols)}；頻道 {', '.join(channels)}",
+            created_at=now,
+            trade_date=now.astimezone(ZoneInfo(self.settings.timezone)).date().isoformat(),
+            metrics={"symbols": new_symbols, "channels": channels},
+        )
+
+    def _realtime_capture_target_symbols(self, now: datetime) -> list[str]:
+        trade_date = now.astimezone(ZoneInfo(self.settings.timezone)).date().isoformat()
+        symbols: set[str] = set()
+        for strategy in ("daytrade", "swing"):
+            symbols.update(candidate.symbol for candidate in self.store.list_candidates(trade_date, strategy) if candidate.status == "active")
+        symbols.update(position.symbol for position in self.store.list_positions())
+        symbols.update(order.symbol for order in self.store.list_open_orders())
+        return sorted(symbols)[: max(0, self.settings.realtime_capture_max_symbols)]
+
+    def _handle_realtime_market_event(self, event: RealtimeMarketEvent) -> None:
+        if self.thread and self.thread.is_alive():
+            try:
+                self._realtime_capture_queue.put_nowait(event)
+            except queue.Full:
+                self._realtime_capture_dropped += 1
+            return
+        self._record_realtime_market_event(event)
+
+    def _start_realtime_capture_drain(self) -> None:
+        if self._realtime_capture_thread and self._realtime_capture_thread.is_alive():
+            return
+        self._realtime_capture_thread = threading.Thread(target=self._realtime_capture_drain_loop, daemon=True)
+        self._realtime_capture_thread.start()
+
+    def _realtime_capture_drain_loop(self) -> None:
+        while not self.stop_event.is_set() or not self._realtime_capture_queue.empty():
+            try:
+                event = self._realtime_capture_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self._record_realtime_market_event(event)
+            finally:
+                self._realtime_capture_queue.task_done()
+
+    def _record_realtime_market_event(self, event: RealtimeMarketEvent) -> None:
+        try:
+            event_key = _market_event_key(event)
+            self.store.insert_market_data_event(
+                channel=event.channel,
+                symbol=event.symbol,
+                exchange_time=event.exchange_time,
+                received_at=event.received_at,
+                payload=event.payload,
+                event_key=event_key,
+            )
+            if event.channel == "trades":
+                self._record_realtime_trade(event, event_key)
+            elif event.channel == "books":
+                self._record_realtime_book(event, event_key)
+            elif event.channel == "aggregates":
+                self._record_quote(parse_aggregates_message(event.raw, received_at=event.received_at), 1)
+            elif event.channel == "candles":
+                self._record_realtime_candle(event)
+        except Exception as exc:
+            key = f"{event.channel}:{exc.__class__.__name__}"
+            if key in self._realtime_capture_error_keys:
+                return
+            self._realtime_capture_error_keys.add(key)
+            self._log_event(
+                "market_data",
+                "realtime_capture",
+                "realtime_capture_event_error",
+                "盤中行情寫入失敗",
+                detail=f"{event.channel} {event.symbol}: {exc.__class__.__name__}: {exc}",
+                severity="warning",
+                symbol=event.symbol,
+                created_at=event.received_at,
+                trade_date=event.received_at.astimezone(ZoneInfo(self.settings.timezone)).date().isoformat(),
+            )
+
+    def _record_realtime_trade(self, event: RealtimeMarketEvent, event_key: str) -> None:
+        price = _payload_float(event.payload, "price")
+        size = _payload_float(event.payload, "size")
+        if price is None or size is None or price <= 0 or size <= 0:
+            return
+        bid = _payload_float(event.payload, "bid")
+        ask = _payload_float(event.payload, "ask")
+        volume = _payload_float(event.payload, "volume")
+        serial = _payload_text(event.payload, "serial")
+        self.store.insert_market_tick(
+            symbol=event.symbol,
+            trade_time=event.exchange_time,
+            received_at=event.received_at,
+            price=price,
+            size=size,
+            bid=bid,
+            ask=ask,
+            volume=volume,
+            serial=serial,
+            side=_trade_side(price, bid, ask),
+            raw=event.raw,
+            event_key=event_key,
+        )
+
+    def _record_realtime_book(self, event: RealtimeMarketEvent, event_key: str) -> None:
+        self.store.insert_order_book(
+            symbol=event.symbol,
+            exchange_time=event.exchange_time,
+            received_at=event.received_at,
+            bids=_levels_from_payload(event.payload.get("bids")),
+            asks=_levels_from_payload(event.payload.get("asks")),
+            raw=event.raw,
+            event_key=event_key,
+        )
+
+    def _record_realtime_candle(self, event: RealtimeMarketEvent) -> None:
+        open_price = _payload_float(event.payload, "open")
+        high_price = _payload_float(event.payload, "high")
+        low_price = _payload_float(event.payload, "low")
+        close_price = _payload_float(event.payload, "close")
+        volume = _payload_float(event.payload, "volume")
+        if None in (open_price, high_price, low_price, close_price, volume):
+            return
+        timeframe = int(_payload_float(event.payload, "timeframe") or 1)
+        start, end = bucket_bounds(event.exchange_time, timeframe)
+        self.store.upsert_ohlc_bar(
+            symbol=event.symbol,
+            timeframe_minutes=timeframe,
+            start_time=start,
+            end_time=end,
+            open_price=float(open_price),
+            high_price=float(high_price),
+            low_price=float(low_price),
+            close_price=float(close_price),
+            volume=float(volume),
+            source="taishin_nova_candles",
+        )
+
     def _loop(self) -> None:
         while not self.stop_event.is_set():
             try:
@@ -508,6 +706,7 @@ class TradingLabWorker:
                 score=pick.score,
                 reason=f"{pick.reason}；scout_version={scout_version}",
                 source="auto_scout",
+                scout_version=scout_version,
                 status="active",
                 created_at=now,
             )
@@ -785,6 +984,37 @@ class TradingLabWorker:
             if order.strategy != strategy:
                 continue
             filled = False
+            ticks = self.store.get_ticks_after(order.symbol, order.created_at, order.expires_at)
+            for tick in ticks:
+                if _tick_should_fill(order, tick):
+                    fill_time = datetime.fromisoformat(str(tick["trade_time"]))
+                    mark_filled(self.store, order, order.price, fill_time)
+                    trade_date = fill_time.astimezone(ZoneInfo(self.settings.timezone)).date().isoformat()
+                    self._log_event(
+                        _actor_for_strategy(strategy),
+                        "fill_check",
+                        "order_filled",
+                        "模擬成交",
+                        detail=f"{order.side} {order.qty:,} 股 @ {order.price:,.2f}",
+                        strategy=strategy,
+                        symbol=order.symbol,
+                        ref_table="orders",
+                        ref_id=order.id,
+                        created_at=fill_time,
+                        trade_date=trade_date,
+                        metrics={
+                            "side": order.side,
+                            "price": order.price,
+                            "qty": order.qty,
+                            "source": "tick",
+                            "tick_price": float(tick["price"]),
+                            "tick_size": float(tick["size"]),
+                        },
+                    )
+                    filled = True
+                    break
+            if filled:
+                continue
             snapshots = self.store.get_snapshots_after(order.symbol, order.created_at, order.expires_at)
             for snapshot in snapshots:
                 if _snapshot_should_fill(order, snapshot):
@@ -852,8 +1082,9 @@ class TradingLabWorker:
             return False
         if any(order.symbol == symbol and order.account_id == account_id and order.side == "sell" for order in self.store.list_open_orders()):
             return False
-        bid = quote.bid_levels[0].price if quote.bid_levels else quote.price
-        ask = quote.ask_levels[0].price if quote.ask_levels else quote.price
+        book = self.store.latest_order_book(symbol, now)
+        bid = float(book["best_bid"]) if book is not None and book["best_bid"] is not None else (quote.bid_levels[0].price if quote.bid_levels else quote.price)
+        ask = float(book["best_ask"]) if book is not None and book["best_ask"] is not None else (quote.ask_levels[0].price if quote.ask_levels else quote.price)
         reason = ""
         price = bid
         if force_exit:
@@ -878,6 +1109,9 @@ class TradingLabWorker:
                 stop_loss=position.stop_loss,
                 take_profit=position.take_profit,
                 strategy_version=position.strategy_version,
+                candidate_id=position.candidate_id,
+                entry_order_id=position.entry_order_id,
+                scout_version=position.scout_version,
                 created_at=now,
             )
         except (KeyError, ValueError) as exc:
@@ -907,7 +1141,15 @@ class TradingLabWorker:
             ref_id=order_id,
             created_at=now,
             trade_date=now.astimezone(ZoneInfo(self.settings.timezone)).date().isoformat(),
-            metrics={"price": price, "qty": position.qty, "force_exit": force_exit, "strategy_version": position.strategy_version},
+            metrics={
+                "price": price,
+                "qty": position.qty,
+                "force_exit": force_exit,
+                "strategy_version": position.strategy_version,
+                "candidate_id": position.candidate_id,
+                "entry_order_id": position.entry_order_id,
+                "scout_version": position.scout_version,
+            },
         )
         return True
 
@@ -940,6 +1182,10 @@ class TradingLabWorker:
                         expires_at=now,
                         stop_loss=position.stop_loss,
                         take_profit=position.take_profit,
+                        strategy_version=position.strategy_version,
+                        candidate_id=position.candidate_id,
+                        entry_order_id=position.entry_order_id,
+                        scout_version=position.scout_version,
                         created_at=now,
                     )
                     order = self.store.get_order(order_id)
@@ -973,10 +1219,21 @@ class TradingLabWorker:
                 ref_id=order.id,
                 created_at=now,
                 trade_date=trade_date,
-                metrics={"price": price, "qty": position.qty, "source": source},
+                metrics={
+                    "price": price,
+                    "qty": position.qty,
+                    "source": source,
+                    "strategy_version": position.strategy_version,
+                    "candidate_id": position.candidate_id,
+                    "entry_order_id": position.entry_order_id,
+                    "scout_version": position.scout_version,
+                },
             )
 
     def _forced_flatten_price(self, symbol: str, fallback_price: float, now: datetime) -> tuple[float, str, str]:
+        book = self.store.latest_order_book(symbol, now)
+        if book is not None and book["best_bid"] is not None and float(book["best_bid"]) > 0:
+            return float(book["best_bid"]), "latest_order_book_bid", "warning"
         snapshot = self.store.latest_snapshot(symbol, now)
         if snapshot is not None:
             bid = snapshot["bid_price"]
@@ -1528,6 +1785,63 @@ def _snapshot_should_fill(order, snapshot: Row) -> bool:
     if order.side == "buy":
         return price <= order.price or (ask_price is not None and ask_price <= order.price)
     return price >= order.price or (bid_price is not None and bid_price >= order.price)
+
+
+def _tick_should_fill(order, tick: Row) -> bool:
+    price = float(tick["price"])
+    size = float(tick["size"])
+    if size <= 0:
+        return False
+    if order.side == "buy":
+        return price <= order.price
+    return price >= order.price
+
+
+def _market_event_key(event: RealtimeMarketEvent) -> str:
+    serial = _payload_text(event.payload, "serial")
+    if serial:
+        return f"{event.channel}:{event.symbol}:{event.exchange_time.isoformat()}:{serial}"
+    source = json.dumps(event.raw, ensure_ascii=False, sort_keys=True, default=str)
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
+    return f"{event.channel}:{event.symbol}:{event.exchange_time.isoformat()}:{digest}"
+
+
+def _payload_float(payload: dict[str, object], key: str) -> float | None:
+    value = payload.get(key)
+    if value is None or value == "":
+        return None
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _payload_text(payload: dict[str, object], key: str) -> str:
+    value = payload.get(key)
+    return "" if value is None else str(value)
+
+
+def _levels_from_payload(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    levels: list[dict[str, object]] = []
+    for row in value[:5]:
+        if not isinstance(row, dict):
+            continue
+        price = _payload_float(row, "price")
+        size = _payload_float(row, "size")
+        if price is None or size is None or price <= 0 or size <= 0:
+            continue
+        levels.append({"price": price, "size": size})
+    return levels
+
+
+def _trade_side(price: float, bid: float | None, ask: float | None) -> str:
+    if ask is not None and price >= ask:
+        return "ask"
+    if bid is not None and price <= bid:
+        return "bid"
+    return ""
 
 
 def _auto_scout_time(value: str) -> time:

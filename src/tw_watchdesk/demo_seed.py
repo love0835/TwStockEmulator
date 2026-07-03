@@ -112,6 +112,10 @@ def seed_all(store: TradingStore) -> None:
             stop_loss=round(buy_price * 0.94, 2),
             take_profit=round(buy_price * 1.10, 2),
             strategy_version=buy_order.strategy_version,
+            candidate_id=buy_order.candidate_id,
+            entry_order_id=buy_order.id,
+            scout_version=buy_order.scout_version,
+            attribution_status=buy_order.attribution_status,
             at=buy_time + timedelta(seconds=3),
         )
         if idx % 2 == 0:
@@ -254,7 +258,7 @@ def _seed_daytrade(store: TradingStore, start: datetime) -> None:
         buy_order = store.get_order(buy_id)
         buy_costs = calculate_costs(side="buy", strategy="daytrade", price=buy_price, qty=buy_qty)
         store.record_fill(order=buy_order, price=buy_price, qty=buy_qty, fee=buy_costs.fee, tax=buy_costs.tax, net_cash_delta=buy_costs.net_cash_delta, realized_pnl=0, filled_at=buy_time + timedelta(seconds=2))
-        store.upsert_position_after_fill(account_id=DAYTRADE_ACCOUNT, strategy="daytrade", symbol=symbol, side="buy", qty=buy_qty, price=buy_price, fee=buy_costs.fee, realized_pnl=0, stop_loss=round(buy_price * 0.985, 2), take_profit=round(buy_price * 1.025, 2), at=buy_time + timedelta(seconds=2))
+        store.upsert_position_after_fill(account_id=DAYTRADE_ACCOUNT, strategy="daytrade", symbol=symbol, side="buy", qty=buy_qty, price=buy_price, fee=buy_costs.fee, realized_pnl=0, stop_loss=round(buy_price * 0.985, 2), take_profit=round(buy_price * 1.025, 2), strategy_version=buy_order.strategy_version, candidate_id=buy_order.candidate_id, entry_order_id=buy_order.id, scout_version=buy_order.scout_version, attribution_status=buy_order.attribution_status, at=buy_time + timedelta(seconds=2))
         sell_price = round(buy_price * (1.018 if idx in {0, 1, 4} else 0.992), 2)
         sell_time = day.replace(hour=4, minute=20)
         sell_id = store.create_order(account_id=DAYTRADE_ACCOUNT, strategy="daytrade", symbol=symbol, side="sell", price=sell_price, qty=buy_qty, reason="demo 當沖出場", expires_at=sell_time + timedelta(minutes=5), candidate_id=candidate_id, created_at=sell_time)

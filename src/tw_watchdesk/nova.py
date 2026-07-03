@@ -5,10 +5,10 @@ import threading
 import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from tw_watchdesk.config import Settings
-from tw_watchdesk.models import OrderBookLevel, Quote
+from tw_watchdesk.models import OrderBookLevel, Quote, RealtimeMarketEvent
 
 
 class QuoteProvider(Protocol):
@@ -21,8 +21,19 @@ class StockRestClientProvider(Protocol):
         ...
 
 
+class RealtimeMarketDataProvider(Protocol):
+    def add_market_data_listener(self, listener: Callable[[RealtimeMarketEvent], None]) -> None:
+        ...
+
+    def subscribe_market_data(self, symbols: list[str], channels: tuple[str, ...]) -> None:
+        ...
+
+
 class ProviderUnavailable(RuntimeError):
     pass
+
+
+MARKET_DATA_CHANNELS = {"trades", "books", "aggregates", "candles", "indices"}
 
 
 def parse_aggregates_message(message: str | Mapping[str, Any], received_at: datetime | None = None) -> Quote:
@@ -86,6 +97,36 @@ def parse_aggregates_message(message: str | Mapping[str, Any], received_at: date
     )
 
 
+def parse_realtime_market_event(message: str | Mapping[str, Any], received_at: datetime | None = None) -> RealtimeMarketEvent | None:
+    received_at = received_at or datetime.now(timezone.utc)
+    decoded = json.loads(message) if isinstance(message, str) else message
+    payload = _mapping(decoded)
+    if not payload:
+        return None
+    raw = dict(payload)
+    event_type = str(payload.get("event") or "").lower()
+    if event_type and event_type != "data":
+        return None
+    data = _mapping(payload.get("data") or payload.get("payload") or payload)
+    channel = str(payload.get("channel") or data.get("channel") or "").strip().lower()
+    if not channel:
+        channel = _infer_channel(data)
+    if channel not in MARKET_DATA_CHANNELS:
+        return None
+    symbol = str(_first(data, "symbol", "code", "stockNo") or "").upper()
+    if not symbol:
+        return None
+    exchange_time = _timestamp(_first(data, "time", "date", "lastUpdated", "lastUpdate", "lastTrade.time", "timestamp")) or received_at
+    return RealtimeMarketEvent(
+        channel=channel,
+        symbol=symbol,
+        exchange_time=exchange_time,
+        received_at=received_at,
+        payload=dict(data),
+        raw=dict(payload),
+    )
+
+
 class TaishinNovaProvider:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -110,6 +151,8 @@ class TaishinNovaProvider:
         self._connected = False
         self._sdk: Any = None
         self._stock: Any = None
+        self._listeners: list[Callable[[RealtimeMarketEvent], None]] = []
+        self._channel_subscriptions: set[tuple[str, str]] = set()
 
     def get_quote(self, symbol: str) -> Quote:
         symbol = symbol.upper().strip()
@@ -161,6 +204,30 @@ class TaishinNovaProvider:
         self._ensure_marketdata()
         return _marketdata_rest_stock_client(self._sdk)
 
+    def add_market_data_listener(self, listener: Callable[[RealtimeMarketEvent], None]) -> None:
+        with self._lock:
+            if listener not in self._listeners:
+                self._listeners.append(listener)
+
+    def subscribe_market_data(self, symbols: list[str], channels: tuple[str, ...]) -> None:
+        self._ensure_connected()
+        for symbol in symbols:
+            clean_symbol = symbol.upper().strip()
+            if not clean_symbol:
+                continue
+            for channel in channels:
+                clean_channel = channel.strip().lower()
+                if clean_channel not in MARKET_DATA_CHANNELS:
+                    continue
+                key = (clean_channel, clean_symbol)
+                if key in self._channel_subscriptions:
+                    continue
+                try:
+                    self._stock.subscribe({"channel": clean_channel, "symbol": clean_symbol})
+                except Exception as exc:
+                    raise ProviderUnavailable(f"Nova 訂閱 {clean_channel} 失敗：{clean_symbol}；{exc}") from exc
+                self._channel_subscriptions.add(key)
+
     def _subscribe(self, symbol: str) -> None:
         self._ensure_connected()
         if symbol in self._subscribed:
@@ -172,6 +239,18 @@ class TaishinNovaProvider:
         self._subscribed.add(symbol)
 
     def _handle_message(self, message: Any) -> None:
+        event = parse_realtime_market_event(message)
+        listeners: list[Callable[[RealtimeMarketEvent], None]] = []
+        if event is not None:
+            with self._lock:
+                listeners = list(self._listeners)
+            for listener in listeners:
+                try:
+                    listener(event)
+                except Exception:
+                    continue
+            if event.channel != "aggregates":
+                return
         try:
             quote = parse_aggregates_message(message)
         except Exception:
@@ -243,6 +322,18 @@ def _first(data: Mapping[str, Any], *paths: str) -> Any:
         if value is not None:
             return value
     return None
+
+
+def _infer_channel(data: Mapping[str, Any]) -> str:
+    if "serial" in data or ("price" in data and "size" in data and "volume" in data):
+        return "trades"
+    if "open" in data and "high" in data and "low" in data and "close" in data:
+        return "candles"
+    if ("bids" in data or "asks" in data) and "total" not in data and "closePrice" not in data and "lastPrice" not in data:
+        return "books"
+    if "lastPrice" in data or "closePrice" in data or "total" in data:
+        return "aggregates"
+    return ""
 
 
 def _number(value: Any) -> float | None:

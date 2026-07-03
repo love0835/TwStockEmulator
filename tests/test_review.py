@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 
 from tw_watchdesk.config import Settings
@@ -27,8 +28,8 @@ def _none_changes(keys: list[str]) -> dict[str, object]:
 
 def _seed_review_evidence(store: TradingStore, at: datetime) -> None:
     trade_date = at.date().isoformat()
-    store.upsert_candidate(trade_date=trade_date, strategy="daytrade", symbol="2330", name="台積電", source="manual", created_at=at)
-    store.upsert_candidate(trade_date=trade_date, strategy="swing", symbol="3707", name="漢磊", source="manual", created_at=at)
+    daytrade_candidate_id = store.upsert_candidate(trade_date=trade_date, strategy="daytrade", symbol="2330", name="台積電", source="manual", created_at=at)
+    swing_candidate_id = store.upsert_candidate(trade_date=trade_date, strategy="swing", symbol="3707", name="漢磊", source="manual", created_at=at)
     daytrade_order = store.create_order(
         account_id=DAYTRADE_ACCOUNT,
         strategy="daytrade",
@@ -38,6 +39,7 @@ def _seed_review_evidence(store: TradingStore, at: datetime) -> None:
         qty=1000,
         reason="unit",
         expires_at=at + timedelta(minutes=5),
+        candidate_id=daytrade_candidate_id,
         created_at=at,
     )
     order = store.get_order(daytrade_order)
@@ -51,6 +53,7 @@ def _seed_review_evidence(store: TradingStore, at: datetime) -> None:
         qty=1000,
         reason="unit swing",
         expires_at=at + timedelta(minutes=30),
+        candidate_id=swing_candidate_id,
         created_at=at,
     )
 
@@ -144,6 +147,9 @@ def test_multi_agent_review_creates_pending_versions_without_activation(tmp_path
     assert store.get_strategy_version("daytrade", "daytrade-v2").status == "pending"
     run = store.list_review_runs(review_date="2026-07-03")[0]
     assert run["status"] == "completed"
+    evidence = json.loads(store.get_review_evidence(run["evidence_id"])["evidence_json"])
+    assert evidence["attribution_summary"]["orders"]["status_counts"]["complete"] == 2
+    assert evidence["attribution_summary"]["fills"]["status_counts"]["complete"] == 1
     assert len(store.list_agent_reviews(run["id"])) == 5
     statuses = {(row["strategy"], row["status"]) for row in store.list_strategy_proposals(run["id"])}
     assert ("scout", "pending_version_created") in statuses

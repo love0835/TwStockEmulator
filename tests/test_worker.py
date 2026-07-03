@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from tw_watchdesk.llm import CodexResult
 from tw_watchdesk.config import Settings
 from tw_watchdesk.models import OrderBookLevel, Quote
+from tw_watchdesk.nova import parse_realtime_market_event
 from tw_watchdesk.storage import DAYTRADE_ACCOUNT, SWING_ACCOUNT, TradingStore
 from tw_watchdesk.worker import TradingLabWorker
 
@@ -12,9 +13,23 @@ class FakeProvider:
     def __init__(self, quote: Quote) -> None:
         self.quote = quote
         self.snapshot_rows: list[dict[str, object]] = []
+        self.listeners = []
+        self.market_data_subscriptions: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
 
     def get_quote(self, symbol: str) -> Quote:
         return self.quote
+
+    def add_market_data_listener(self, listener) -> None:
+        self.listeners.append(listener)
+
+    def subscribe_market_data(self, symbols: list[str], channels: tuple[str, ...]) -> None:
+        self.market_data_subscriptions.append((tuple(symbols), tuple(channels)))
+
+    def emit_market_data(self, message: dict[str, object], received_at: datetime) -> None:
+        event = parse_realtime_market_event(message, received_at=received_at)
+        assert event is not None
+        for listener in list(self.listeners):
+            listener(event)
 
     def get_stock_rest_client(self):
         provider = self
@@ -146,6 +161,55 @@ def _seed_daytrade_roundtrip(store: TradingStore, at: datetime) -> None:
         take_profit=None,
         at=at + timedelta(hours=3, seconds=1),
     )
+
+
+def _seed_attributed_position(store: TradingStore, *, account_id: str, strategy: str, symbol: str, at: datetime) -> tuple[int, int]:
+    candidate_id = store.upsert_candidate(
+        trade_date=at.date().isoformat(),
+        strategy=strategy,
+        symbol=symbol,
+        name=f"{symbol} 測試股",
+        score=75,
+        reason="unit attributed candidate",
+        source="auto_scout",
+        scout_version="scout-v1",
+        created_at=at,
+    )
+    order_id = store.create_order(
+        account_id=account_id,
+        strategy=strategy,
+        symbol=symbol,
+        side="buy",
+        price=100,
+        qty=1000,
+        reason="unit attributed buy",
+        expires_at=at + timedelta(minutes=5 if strategy == "daytrade" else 30),
+        stop_loss=98,
+        take_profit=103,
+        candidate_id=candidate_id,
+        created_at=at,
+    )
+    order = store.get_order(order_id)
+    store.record_fill(order=order, price=100, qty=1000, fee=142.5, tax=0, net_cash_delta=-100_142.5, realized_pnl=0, filled_at=at + timedelta(seconds=1))
+    store.upsert_position_after_fill(
+        account_id=account_id,
+        strategy=strategy,
+        symbol=symbol,
+        side="buy",
+        qty=1000,
+        price=100,
+        fee=142.5,
+        realized_pnl=0,
+        stop_loss=98,
+        take_profit=103,
+        strategy_version=order.strategy_version,
+        candidate_id=order.candidate_id,
+        entry_order_id=order.id,
+        scout_version=order.scout_version,
+        attribution_status=order.attribution_status,
+        at=at + timedelta(seconds=1),
+    )
+    return order_id, candidate_id
 
 
 def _valid_swing_review_payload() -> dict[str, object]:
@@ -322,6 +386,115 @@ def test_worker_creates_order_and_fills_on_later_bar(tmp_path) -> None:
     event_types = {row["event_type"] for row in store.list_monitor_events(trade_date="2026-07-02")}
     assert "buy_order_created" in event_types
     assert "order_filled" in event_types
+
+
+def test_worker_realtime_capture_subscribes_candidates_and_persists_events(tmp_path) -> None:
+    store = TradingStore(tmp_path / "lab.sqlite3")
+    store.initialize()
+    now = datetime(2026, 7, 2, 1, 10, tzinfo=timezone.utc)
+    provider = FakeProvider(_quote(now))
+    worker = TradingLabWorker(settings=Settings(enable_auto_scout=False), store=store, provider=provider)
+    store.upsert_candidate(trade_date="2026-07-02", strategy="daytrade", symbol="2330", name="台積電")
+
+    worker.run_tick(now)
+
+    assert provider.market_data_subscriptions
+    symbols, channels = provider.market_data_subscriptions[0]
+    assert symbols == ("2330",)
+    assert channels == ("trades", "books", "aggregates", "candles")
+    provider.emit_market_data(
+        {
+            "event": "data",
+            "channel": "trades",
+            "data": {"symbol": "2330", "price": 99.5, "size": 10, "bid": 99.5, "ask": 99.6, "volume": 10000, "time": int((now + timedelta(seconds=5)).timestamp() * 1_000_000), "serial": 1},
+        },
+        received_at=now + timedelta(seconds=5),
+    )
+    provider.emit_market_data(
+        {
+            "event": "data",
+            "channel": "books",
+            "data": {"symbol": "2330", "bids": [{"price": 99.5, "size": 10}], "asks": [{"price": 99.6, "size": 12}], "time": int((now + timedelta(seconds=6)).timestamp() * 1_000_000)},
+        },
+        received_at=now + timedelta(seconds=6),
+    )
+    provider.emit_market_data(
+        {
+            "event": "data",
+            "channel": "candles",
+            "data": {"symbol": "2330", "date": (now + timedelta(minutes=1)).isoformat(), "timeframe": 1, "open": 99.5, "high": 100, "low": 99.5, "close": 100, "volume": 20},
+        },
+        received_at=now + timedelta(minutes=1),
+    )
+
+    assert store.count_market_data_events("trades", "2330") == 1
+    assert store.get_ticks_after("2330", now)[0]["price"] == 99.5
+    assert store.latest_order_book("2330")["best_bid"] == 99.5
+    assert store.get_bars_after("2330", 1, now - timedelta(minutes=1))
+
+
+def test_worker_realtime_capture_drain_flushes_queued_events_after_stop(tmp_path) -> None:
+    store = TradingStore(tmp_path / "lab.sqlite3")
+    store.initialize()
+    now = datetime(2026, 7, 2, 1, 10, tzinfo=timezone.utc)
+    worker = TradingLabWorker(settings=Settings(enable_auto_scout=False), store=store, provider=FakeProvider(_quote(now)))
+    event = parse_realtime_market_event(
+        {
+            "event": "data",
+            "channel": "trades",
+            "data": {
+                "symbol": "2330",
+                "price": 99.5,
+                "size": 10,
+                "volume": 10000,
+                "time": int((now + timedelta(seconds=5)).timestamp() * 1_000_000),
+                "serial": 1,
+            },
+        },
+        received_at=now + timedelta(seconds=5),
+    )
+    assert event is not None
+    worker.stop_event.set()
+    worker._realtime_capture_queue.put_nowait(event)
+
+    worker._realtime_capture_drain_loop()
+
+    assert store.count_market_data_events("trades", "2330") == 1
+    assert store.get_ticks_after("2330", now)[0]["price"] == 99.5
+
+
+def test_worker_fills_open_order_from_realtime_tick(tmp_path) -> None:
+    store = TradingStore(tmp_path / "lab.sqlite3")
+    store.initialize()
+    created_at = datetime(2026, 7, 2, 1, 10, tzinfo=timezone.utc)
+    order_id = store.create_order(
+        account_id=DAYTRADE_ACCOUNT,
+        strategy="daytrade",
+        symbol="2330",
+        side="buy",
+        price=100,
+        qty=1000,
+        reason="tick fill",
+        expires_at=created_at + timedelta(minutes=5),
+        created_at=created_at,
+    )
+    store.insert_market_tick(
+        symbol="2330",
+        trade_time=created_at + timedelta(seconds=2),
+        received_at=created_at + timedelta(seconds=2),
+        price=99.5,
+        size=1000,
+        raw={"channel": "trades"},
+        event_key="tick-fill",
+    )
+    worker = TradingLabWorker(settings=Settings(enable_auto_scout=False), store=store, provider=FakeProvider(_quote(created_at)))
+
+    worker.run_tick(created_at + timedelta(minutes=1))
+
+    assert store.get_order(order_id).status == "filled"
+    assert store.list_fills()[0]["symbol"] == "2330"
+    fill_events = [row for row in store.list_monitor_events(symbol="2330") if row["event_type"] == "order_filled"]
+    assert json.loads(fill_events[0]["metrics_json"])["source"] == "tick"
 
 
 def test_worker_creates_daytrade_order_without_eligible_file(tmp_path) -> None:
@@ -550,6 +723,28 @@ def test_worker_monitors_existing_swing_position_without_today_candidate(tmp_pat
     assert orders[0]["reason"] == "觸發停損，建立出場模擬單"
 
 
+def test_worker_exit_order_keeps_position_attribution(tmp_path) -> None:
+    store = TradingStore(tmp_path / "lab.sqlite3")
+    store.initialize()
+    opened_at = datetime(2026, 7, 2, 4, 30, tzinfo=timezone.utc)
+    entry_order_id, candidate_id = _seed_attributed_position(store, account_id=SWING_ACCOUNT, strategy="swing", symbol="3707", at=opened_at)
+    now = datetime(2026, 7, 3, 1, 30, tzinfo=timezone.utc)
+    worker = TradingLabWorker(
+        settings=Settings(enable_auto_scout=False),
+        store=store,
+        provider=FakeProvider(_quote(now, price=81.5, symbol="3707", name="漢磊")),
+    )
+
+    worker.run_tick(now)
+
+    sell_order = [row for row in store.list_orders() if row["side"] == "sell"][0]
+    assert sell_order["candidate_id"] == candidate_id
+    assert sell_order["entry_order_id"] == entry_order_id
+    assert sell_order["strategy_version"] == "swing-v1"
+    assert sell_order["scout_version"] == "scout-v1"
+    assert sell_order["attribution_status"] == "complete"
+
+
 def test_worker_forces_daytrade_flatten_before_daily_review(tmp_path) -> None:
     store = TradingStore(tmp_path / "lab.sqlite3")
     store.initialize()
@@ -579,6 +774,66 @@ def test_worker_forces_daytrade_flatten_before_daily_review(tmp_path) -> None:
     assert orders[0]["side"] == "sell"
     events = store.list_monitor_events(trade_date="2026-07-02", actor="risk_manager")
     assert any(row["event_type"] == "daytrade_forced_flatten" for row in events)
+
+
+def test_worker_force_flatten_order_keeps_position_attribution(tmp_path) -> None:
+    store = TradingStore(tmp_path / "lab.sqlite3")
+    store.initialize()
+    opened_at = datetime(2026, 7, 2, 1, 10, tzinfo=timezone.utc)
+    entry_order_id, candidate_id = _seed_attributed_position(store, account_id=DAYTRADE_ACCOUNT, strategy="daytrade", symbol="2330", at=opened_at)
+    now = datetime(2026, 7, 2, 5, 30, tzinfo=timezone.utc)
+    worker = TradingLabWorker(settings=Settings(enable_auto_scout=False), store=store, provider=FakeProvider(_quote(now, price=101)))
+
+    worker.run_tick(now)
+
+    sell_order = [row for row in store.list_orders() if row["side"] == "sell"][0]
+    assert sell_order["status"] == "filled"
+    assert sell_order["candidate_id"] == candidate_id
+    assert sell_order["entry_order_id"] == entry_order_id
+    assert sell_order["strategy_version"] == "daytrade-v1"
+    assert sell_order["scout_version"] == "scout-v1"
+    assert sell_order["attribution_status"] == "complete"
+    sell_fill = [row for row in store.list_fills() if row["side"] == "sell"][0]
+    assert sell_fill["candidate_id"] == candidate_id
+    assert sell_fill["entry_order_id"] == entry_order_id
+    assert sell_fill["strategy_version"] == "daytrade-v1"
+
+
+def test_worker_force_flatten_uses_latest_order_book_bid(tmp_path) -> None:
+    store = TradingStore(tmp_path / "lab.sqlite3")
+    store.initialize()
+    opened_at = datetime(2026, 7, 2, 1, 10, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 2, 5, 30, tzinfo=timezone.utc)
+    store.upsert_position_after_fill(
+        account_id=DAYTRADE_ACCOUNT,
+        strategy="daytrade",
+        symbol="2330",
+        side="buy",
+        qty=1000,
+        price=100,
+        fee=142.5,
+        realized_pnl=0,
+        stop_loss=98,
+        take_profit=103,
+        at=opened_at,
+    )
+    store.insert_order_book(
+        symbol="2330",
+        exchange_time=now - timedelta(seconds=1),
+        received_at=now - timedelta(seconds=1),
+        bids=[{"price": 100.8, "size": 20}],
+        asks=[{"price": 100.9, "size": 20}],
+        raw={"channel": "books"},
+        event_key="force-book",
+    )
+    worker = TradingLabWorker(settings=Settings(enable_auto_scout=False), store=store, provider=FakeProvider(_quote(now, price=101)))
+
+    worker.run_tick(now)
+
+    sell_order = [row for row in store.list_orders() if row["side"] == "sell"][0]
+    assert sell_order["price"] == 100.8
+    event = [row for row in store.list_monitor_events(strategy="daytrade") if row["event_type"] == "daytrade_forced_flatten"][0]
+    assert json.loads(event["metrics_json"])["source"] == "latest_order_book_bid"
 
 
 def test_worker_creates_and_applies_valid_swing_strategy_version(tmp_path) -> None:

@@ -310,26 +310,26 @@ class WatchDeskApp:
         self.candidate_tree = self._make_tree_tab(
             notebook,
             "今日候選",
-            ("date", "strategy", "symbol", "status", "score", "source", "reason"),
-            ("日期", "策略", "股票", "狀態", "分數", "來源", "理由"),
+            ("date", "strategy", "symbol", "status", "score", "source", "scout", "reason"),
+            ("日期", "策略", "股票", "狀態", "分數", "來源", "Scout", "理由"),
         )
         self.position_tree = self._make_tree_tab(
             notebook,
             "持倉",
-            ("account", "strategy", "symbol", "qty", "avg", "stop", "take"),
-            ("帳戶", "策略", "股票", "股數", "均價", "停損", "停利"),
+            ("account", "strategy", "symbol", "qty", "avg", "stop", "take", "version", "candidate", "entry", "attr"),
+            ("帳戶", "策略", "股票", "股數", "均價", "停損", "停利", "版本", "候選", "進場單", "歸因"),
         )
         self.order_tree = self._make_tree_tab(
             notebook,
             "委託",
-            ("strategy", "symbol", "side", "price", "qty", "status", "reason"),
-            ("策略", "股票", "買賣", "價格", "股數", "狀態", "理由"),
+            ("strategy", "symbol", "side", "price", "qty", "status", "version", "candidate", "entry", "scout", "attr", "reason"),
+            ("策略", "股票", "買賣", "價格", "股數", "狀態", "版本", "候選", "進場單", "Scout", "歸因", "理由"),
         )
         self.fill_tree = self._make_tree_tab(
             notebook,
             "成交",
-            ("time", "strategy", "symbol", "side", "price", "qty", "pnl"),
-            ("時間", "策略", "股票", "買賣", "價格", "股數", "損益"),
+            ("time", "strategy", "symbol", "side", "price", "qty", "pnl", "version", "candidate", "entry", "scout", "attr"),
+            ("時間", "策略", "股票", "買賣", "價格", "股數", "損益", "版本", "候選", "進場單", "Scout", "歸因"),
         )
         self.review_tree = self._make_tree_tab(
             notebook,
@@ -921,6 +921,7 @@ class WatchDeskApp:
                     _candidate_status_label(row.status),
                     f"{row.score:.1f}",
                     row.source,
+                    row.scout_version,
                     row.reason,
                 )
                 for row in self.store.list_candidates(today)[:200]
@@ -937,6 +938,10 @@ class WatchDeskApp:
                     f"{row.avg_cost:,.2f}",
                     _money(row.stop_loss),
                     _money(row.take_profit),
+                    row.strategy_version,
+                    _optional_id(row.candidate_id),
+                    _optional_id(row.entry_order_id),
+                    row.attribution_status,
                 )
                 for row in self.store.list_positions()
             ],
@@ -951,6 +956,11 @@ class WatchDeskApp:
                     f"{float(row['price']):,.2f}",
                     f"{int(row['qty']):,}",
                     row["status"],
+                    row["strategy_version"],
+                    _optional_id(row["candidate_id"]),
+                    _optional_id(row["entry_order_id"]),
+                    row["scout_version"],
+                    row["attribution_status"],
                     row["reason"],
                 )
                 for row in self.store.list_orders(limit=200)
@@ -967,6 +977,11 @@ class WatchDeskApp:
                     f"{float(row['price']):,.2f}",
                     f"{int(row['qty']):,}",
                     f"{float(row['realized_pnl']):,.2f}",
+                    row["strategy_version"],
+                    _optional_id(row["candidate_id"]),
+                    _optional_id(row["entry_order_id"]),
+                    row["scout_version"],
+                    row["attribution_status"],
                 )
                 for row in self.store.list_fills(limit=200)
             ],
@@ -1250,6 +1265,10 @@ class WatchDeskApp:
 
 def _money(value: float | None) -> str:
     return "-" if value is None else f"{value:,.2f}"
+
+
+def _optional_id(value: object) -> str:
+    return "-" if value is None or value == "" else str(value)
 
 
 def _stock_label(symbol: object, name: object = "") -> str:

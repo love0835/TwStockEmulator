@@ -19,6 +19,7 @@ build = [
 
 [project.scripts]
 tw-watchdesk = "tw_watchdesk.app:main"
+tw-watchdesk-setup = "tw_watchdesk.setup_wizard:main"
 
 [build-system]
 requires = ["hatchling>=1.27.0"]

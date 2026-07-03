@@ -10,6 +10,9 @@ def test_load_settings_from_env_file(tmp_path) -> None:
                 "TW_WATCH_STALE_SECONDS=30",
                 "TW_WATCH_DB_PATH=data/demo.sqlite3",
                 "TW_WATCH_ENABLE_AUTO_SCOUT=true",
+                "TW_WATCH_ENABLE_REALTIME_CAPTURE=true",
+                "TW_WATCH_REALTIME_CAPTURE_CHANNELS=trades,books",
+                "TW_WATCH_REALTIME_CAPTURE_MAX_SYMBOLS=12",
                 "TW_WATCH_AUTO_SCOUT_TIME=09:08",
                 "TW_WATCH_SCOUT_MAX_DAYTRADE=3",
                 "TW_WATCH_SCOUT_MAX_SWING=4",
@@ -28,6 +31,9 @@ def test_load_settings_from_env_file(tmp_path) -> None:
     assert settings.stale_seconds == 30
     assert settings.db_path == tmp_path / "data/demo.sqlite3"
     assert settings.enable_auto_scout is True
+    assert settings.enable_realtime_capture is True
+    assert settings.realtime_capture_channels == ("trades", "books")
+    assert settings.realtime_capture_max_symbols == 12
     assert settings.auto_scout_time == "09:08"
     assert settings.scout_max_daytrade == 3
     assert settings.scout_max_swing == 4

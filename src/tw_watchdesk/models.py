@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,16 @@ class Quote:
     @property
     def change_pct(self) -> float:
         return self.change / self.previous_close if self.previous_close > 0 else 0.0
+
+
+@dataclass(frozen=True)
+class RealtimeMarketEvent:
+    channel: str
+    symbol: str
+    exchange_time: datetime
+    received_at: datetime
+    payload: dict[str, Any]
+    raw: dict[str, Any]
 
 
 @dataclass(frozen=True)

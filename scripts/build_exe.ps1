@@ -32,4 +32,20 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
+& $Python -m PyInstaller `
+    --clean `
+    --noconfirm `
+    --name TwWatchDeskSetup `
+    --onefile `
+    --windowed `
+    --paths src `
+    --hidden-import taishin_sdk `
+    --hidden-import fugle_marketdata `
+    --hidden-import tw_watchdesk.setup_env `
+    "src\tw_watchdesk\setup_wizard.py"
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
 Write-Host "Built dist\TwWatchDesk.exe"
+Write-Host "Built dist\TwWatchDeskSetup.exe"

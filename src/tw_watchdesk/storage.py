@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -48,6 +49,7 @@ class Candidate:
     score: float
     reason: str
     source: str
+    scout_version: str
     status: str
     created_at: datetime
 
@@ -64,9 +66,16 @@ class OrderRecord:
     status: str
     reason: str
     reserved_cash: float
+    candidate_id: int | None
+    entry_order_id: int | None
     stop_loss: float | None
     take_profit: float | None
     strategy_version: str
+    scout_version: str
+    candidate_score: float | None
+    candidate_source: str
+    candidate_reason: str
+    attribution_status: str
     created_at: datetime
     expires_at: datetime
 
@@ -83,6 +92,13 @@ class Position:
     take_profit: float | None
     realized_pnl: float
     strategy_version: str
+    candidate_id: int | None
+    entry_order_id: int | None
+    scout_version: str
+    candidate_score: float | None
+    candidate_source: str
+    candidate_reason: str
+    attribution_status: str
     updated_at: datetime
 
 
@@ -180,6 +196,7 @@ class TradingStore:
                     score REAL NOT NULL DEFAULT 0,
                     reason TEXT NOT NULL DEFAULT '',
                     source TEXT NOT NULL DEFAULT 'manual',
+                    scout_version TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL DEFAULT 'active',
                     created_at TEXT NOT NULL,
                     UNIQUE(trade_date, strategy, symbol)
@@ -214,6 +231,47 @@ class TradingStore:
                     UNIQUE(symbol, timeframe_minutes, start_time)
                 );
 
+                CREATE TABLE IF NOT EXISTS market_data_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    channel TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    exchange_time TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    event_key TEXT NOT NULL UNIQUE,
+                    payload_json TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE TABLE IF NOT EXISTS market_ticks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    trade_time TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    size REAL NOT NULL,
+                    bid REAL,
+                    ask REAL,
+                    volume REAL,
+                    serial TEXT NOT NULL DEFAULT '',
+                    side TEXT NOT NULL DEFAULT '',
+                    event_key TEXT NOT NULL UNIQUE,
+                    raw_json TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE TABLE IF NOT EXISTS order_books (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    exchange_time TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    best_bid REAL,
+                    best_ask REAL,
+                    bid_count INTEGER NOT NULL DEFAULT 0,
+                    ask_count INTEGER NOT NULL DEFAULT 0,
+                    bids_json TEXT NOT NULL DEFAULT '[]',
+                    asks_json TEXT NOT NULL DEFAULT '[]',
+                    event_key TEXT NOT NULL UNIQUE,
+                    raw_json TEXT NOT NULL DEFAULT '{}'
+                );
+
                 CREATE TABLE IF NOT EXISTS orders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     account_id TEXT NOT NULL REFERENCES accounts(id),
@@ -227,9 +285,15 @@ class TradingStore:
                     reason TEXT NOT NULL DEFAULT '',
                     reserved_cash REAL NOT NULL DEFAULT 0,
                     candidate_id INTEGER REFERENCES candidates(id),
+                    entry_order_id INTEGER REFERENCES orders(id),
                     stop_loss REAL,
                     take_profit REAL,
                     strategy_version TEXT NOT NULL DEFAULT '',
+                    scout_version TEXT NOT NULL DEFAULT '',
+                    candidate_score REAL,
+                    candidate_source TEXT NOT NULL DEFAULT '',
+                    candidate_reason TEXT NOT NULL DEFAULT '',
+                    attribution_status TEXT NOT NULL DEFAULT 'legacy_unverified',
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     filled_at TEXT,
@@ -251,6 +315,10 @@ class TradingStore:
                     net_cash_delta REAL NOT NULL,
                     realized_pnl REAL NOT NULL DEFAULT 0,
                     strategy_version TEXT NOT NULL DEFAULT '',
+                    candidate_id INTEGER REFERENCES candidates(id),
+                    entry_order_id INTEGER REFERENCES orders(id),
+                    scout_version TEXT NOT NULL DEFAULT '',
+                    attribution_status TEXT NOT NULL DEFAULT 'legacy_unverified',
                     filled_at TEXT NOT NULL
                 );
 
@@ -264,6 +332,10 @@ class TradingStore:
                     take_profit REAL,
                     realized_pnl REAL NOT NULL DEFAULT 0,
                     strategy_version TEXT NOT NULL DEFAULT '',
+                    candidate_id INTEGER REFERENCES candidates(id),
+                    entry_order_id INTEGER REFERENCES orders(id),
+                    scout_version TEXT NOT NULL DEFAULT '',
+                    attribution_status TEXT NOT NULL DEFAULT 'legacy_unverified',
                     opened_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(account_id, symbol)
@@ -454,6 +526,7 @@ class TradingStore:
             )
             self._ensure_order_schema()
             self._ensure_strategy_version_columns()
+            self._ensure_market_data_schema()
             self._hydrate_open_buy_reserves()
             self._dedupe_open_orders()
             self._reconcile_reserved_cash()
@@ -464,21 +537,55 @@ class TradingStore:
                 WHERE status = 'open'
                 """
             )
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_market_data_events_symbol_time ON market_data_events(symbol, exchange_time)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_market_ticks_symbol_time ON market_ticks(symbol, trade_time)")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_order_books_symbol_time ON order_books(symbol, exchange_time)")
+            self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_market_data_events_event_key ON market_data_events(event_key) WHERE event_key <> ''")
+            self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_market_ticks_event_key ON market_ticks(event_key) WHERE event_key <> ''")
+            self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_order_books_event_key ON order_books(event_key) WHERE event_key <> ''")
             self._seed_accounts()
             self._seed_strategy_versions()
             self._conn.commit()
 
     def _ensure_order_schema(self) -> None:
-        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(orders)").fetchall()}
-        if "reserved_cash" not in columns:
-            self._conn.execute("ALTER TABLE orders ADD COLUMN reserved_cash REAL NOT NULL DEFAULT 0")
-        if "strategy_version" not in columns:
-            self._conn.execute("ALTER TABLE orders ADD COLUMN strategy_version TEXT NOT NULL DEFAULT ''")
+        _ensure_columns(
+            self._conn,
+            "candidates",
+            (
+                ("scout_version", "TEXT NOT NULL DEFAULT ''"),
+            ),
+        )
+        _ensure_columns(
+            self._conn,
+            "orders",
+            (
+                ("reserved_cash", "REAL NOT NULL DEFAULT 0"),
+                ("strategy_version", "TEXT NOT NULL DEFAULT ''"),
+                ("entry_order_id", "INTEGER REFERENCES orders(id)"),
+                ("scout_version", "TEXT NOT NULL DEFAULT ''"),
+                ("candidate_score", "REAL"),
+                ("candidate_source", "TEXT NOT NULL DEFAULT ''"),
+                ("candidate_reason", "TEXT NOT NULL DEFAULT ''"),
+                ("attribution_status", "TEXT NOT NULL DEFAULT 'legacy_unverified'"),
+            ),
+        )
 
     def _ensure_strategy_version_columns(self) -> None:
         tables = {
-            "fills": (("strategy_version", "TEXT NOT NULL DEFAULT ''"),),
-            "positions": (("strategy_version", "TEXT NOT NULL DEFAULT ''"),),
+            "fills": (
+                ("strategy_version", "TEXT NOT NULL DEFAULT ''"),
+                ("candidate_id", "INTEGER REFERENCES candidates(id)"),
+                ("entry_order_id", "INTEGER REFERENCES orders(id)"),
+                ("scout_version", "TEXT NOT NULL DEFAULT ''"),
+                ("attribution_status", "TEXT NOT NULL DEFAULT 'legacy_unverified'"),
+            ),
+            "positions": (
+                ("strategy_version", "TEXT NOT NULL DEFAULT ''"),
+                ("candidate_id", "INTEGER REFERENCES candidates(id)"),
+                ("entry_order_id", "INTEGER REFERENCES orders(id)"),
+                ("scout_version", "TEXT NOT NULL DEFAULT ''"),
+                ("attribution_status", "TEXT NOT NULL DEFAULT 'legacy_unverified'"),
+            ),
             "daily_reviews": (
                 ("strategy_version", "TEXT NOT NULL DEFAULT ''"),
                 ("llm_summary", "TEXT NOT NULL DEFAULT ''"),
@@ -487,10 +594,44 @@ class TradingStore:
             ),
         }
         for table, columns in tables.items():
-            existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
-            for name, ddl in columns:
-                if name not in existing:
-                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+            _ensure_columns(self._conn, table, columns)
+
+    def _ensure_market_data_schema(self) -> None:
+        _ensure_columns(
+            self._conn,
+            "market_data_events",
+            (
+                ("event_key", "TEXT NOT NULL DEFAULT ''"),
+                ("payload_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ),
+        )
+        _ensure_columns(
+            self._conn,
+            "market_ticks",
+            (
+                ("bid", "REAL"),
+                ("ask", "REAL"),
+                ("volume", "REAL"),
+                ("serial", "TEXT NOT NULL DEFAULT ''"),
+                ("side", "TEXT NOT NULL DEFAULT ''"),
+                ("event_key", "TEXT NOT NULL DEFAULT ''"),
+                ("raw_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ),
+        )
+        _ensure_columns(
+            self._conn,
+            "order_books",
+            (
+                ("best_bid", "REAL"),
+                ("best_ask", "REAL"),
+                ("bid_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("ask_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("bids_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("asks_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("event_key", "TEXT NOT NULL DEFAULT ''"),
+                ("raw_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ),
+        )
 
     def _hydrate_open_buy_reserves(self) -> None:
         self._conn.execute(
@@ -731,6 +872,7 @@ class TradingStore:
         score: float = 0.0,
         reason: str = "",
         source: str = "manual",
+        scout_version: str = "",
         status: str = "active",
         created_at: datetime | None = None,
     ) -> int:
@@ -738,13 +880,14 @@ class TradingStore:
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO candidates(trade_date, strategy, symbol, name, score, reason, source, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO candidates(trade_date, strategy, symbol, name, score, reason, source, scout_version, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(trade_date, strategy, symbol) DO UPDATE SET
                     name = excluded.name,
                     score = excluded.score,
                     reason = excluded.reason,
                     source = excluded.source,
+                    scout_version = excluded.scout_version,
                     status = excluded.status
                 """,
                 (
@@ -755,6 +898,7 @@ class TradingStore:
                     score,
                     reason,
                     source,
+                    scout_version,
                     status,
                     _to_text(created_at),
                 ),
@@ -923,6 +1067,198 @@ class TradingStore:
         with self._lock:
             return self._conn.execute(sql, params).fetchall()
 
+    def insert_market_data_event(
+        self,
+        *,
+        channel: str,
+        symbol: str,
+        exchange_time: datetime,
+        received_at: datetime,
+        payload: dict[str, Any],
+        event_key: str = "",
+    ) -> None:
+        event_key = event_key or _market_event_key(channel, symbol, exchange_time, payload)
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO market_data_events
+                    (channel, symbol, exchange_time, received_at, event_key, payload_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    channel.lower(),
+                    symbol.upper(),
+                    _to_text(exchange_time),
+                    _to_text(received_at),
+                    event_key,
+                    json.dumps(redact_json(payload), ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            self._conn.commit()
+
+    def insert_market_tick(
+        self,
+        *,
+        symbol: str,
+        trade_time: datetime,
+        received_at: datetime,
+        price: float,
+        size: float,
+        bid: float | None = None,
+        ask: float | None = None,
+        volume: float | None = None,
+        serial: str = "",
+        side: str = "",
+        raw: dict[str, Any] | None = None,
+        event_key: str = "",
+    ) -> None:
+        raw = raw or {}
+        event_key = event_key or _market_event_key("trades", symbol, trade_time, {"price": price, "size": size, "serial": serial, **raw})
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO market_ticks
+                    (symbol, trade_time, received_at, price, size, bid, ask, volume, serial, side, event_key, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    symbol.upper(),
+                    _to_text(trade_time),
+                    _to_text(received_at),
+                    price,
+                    size,
+                    bid,
+                    ask,
+                    volume,
+                    serial,
+                    side,
+                    event_key,
+                    json.dumps(redact_json(raw), ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            self._conn.commit()
+
+    def insert_order_book(
+        self,
+        *,
+        symbol: str,
+        exchange_time: datetime,
+        received_at: datetime,
+        bids: list[dict[str, Any]],
+        asks: list[dict[str, Any]],
+        raw: dict[str, Any] | None = None,
+        event_key: str = "",
+    ) -> None:
+        raw = raw or {}
+        best_bid = _level_price(bids, 0)
+        best_ask = _level_price(asks, 0)
+        event_key = event_key or _market_event_key("books", symbol, exchange_time, {"bids": bids, "asks": asks, **raw})
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO order_books
+                    (symbol, exchange_time, received_at, best_bid, best_ask, bid_count, ask_count,
+                     bids_json, asks_json, event_key, raw_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    symbol.upper(),
+                    _to_text(exchange_time),
+                    _to_text(received_at),
+                    best_bid,
+                    best_ask,
+                    len(bids),
+                    len(asks),
+                    json.dumps(redact_json(bids), ensure_ascii=False, sort_keys=True),
+                    json.dumps(redact_json(asks), ensure_ascii=False, sort_keys=True),
+                    event_key,
+                    json.dumps(redact_json(raw), ensure_ascii=False, sort_keys=True),
+                ),
+            )
+            self._conn.commit()
+
+    def get_ticks_after(self, symbol: str, after: datetime, before: datetime | None = None) -> list[sqlite3.Row]:
+        params: list[Any] = [symbol.upper(), _to_text(after)]
+        sql = """
+            SELECT * FROM market_ticks
+            WHERE symbol = ? AND trade_time > ?
+        """
+        if before is not None:
+            sql += " AND trade_time <= ?"
+            params.append(_to_text(before))
+        sql += " ORDER BY trade_time, id"
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
+
+    def latest_order_book(self, symbol: str, before: datetime | None = None) -> sqlite3.Row | None:
+        params: list[Any] = [symbol.upper()]
+        sql = "SELECT * FROM order_books WHERE symbol = ?"
+        if before is not None:
+            sql += " AND exchange_time <= ?"
+            params.append(_to_text(before))
+        sql += " ORDER BY exchange_time DESC, id DESC LIMIT 1"
+        with self._lock:
+            return self._conn.execute(sql, params).fetchone()
+
+    def count_market_data_events(self, channel: str | None = None, symbol: str | None = None) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if channel:
+            clauses.append("channel = ?")
+            params.append(channel.lower())
+        if symbol:
+            clauses.append("symbol = ?")
+            params.append(symbol.upper())
+        sql = "SELECT COUNT(*) AS count FROM market_data_events"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return int(row["count"] or 0)
+
+    def market_data_coverage(self, start_date: date, end_date: date) -> dict[str, Any]:
+        start_text = start_date.isoformat()
+        end_text = end_date.isoformat()
+        with self._lock:
+            channel_rows = self._conn.execute(
+                """
+                SELECT channel, COUNT(*) AS count, COUNT(DISTINCT symbol) AS symbols
+                FROM market_data_events
+                WHERE substr(exchange_time, 1, 10) BETWEEN ? AND ?
+                GROUP BY channel
+                ORDER BY channel
+                """,
+                (start_text, end_text),
+            ).fetchall()
+            tick_row = self._conn.execute(
+                "SELECT COUNT(*) AS count, COUNT(DISTINCT symbol) AS symbols FROM market_ticks WHERE substr(trade_time, 1, 10) BETWEEN ? AND ?",
+                (start_text, end_text),
+            ).fetchone()
+            book_row = self._conn.execute(
+                "SELECT COUNT(*) AS count, COUNT(DISTINCT symbol) AS symbols FROM order_books WHERE substr(exchange_time, 1, 10) BETWEEN ? AND ?",
+                (start_text, end_text),
+            ).fetchone()
+            snapshot_row = self._conn.execute(
+                "SELECT COUNT(*) AS count, COUNT(DISTINCT symbol) AS symbols FROM market_snapshots WHERE substr(snapshot_time, 1, 10) BETWEEN ? AND ?",
+                (start_text, end_text),
+            ).fetchone()
+            bar_row = self._conn.execute(
+                "SELECT COUNT(*) AS count, COUNT(DISTINCT symbol) AS symbols FROM bars WHERE timeframe_minutes = 1 AND substr(start_time, 1, 10) BETWEEN ? AND ?",
+                (start_text, end_text),
+            ).fetchone()
+        return {
+            "data_start": start_text,
+            "data_end": end_text,
+            "events_by_channel": {
+                str(row["channel"]): {"events": int(row["count"] or 0), "symbols": int(row["symbols"] or 0)}
+                for row in channel_rows
+            },
+            "ticks": {"events": int(tick_row["count"] or 0), "symbols": int(tick_row["symbols"] or 0)},
+            "books": {"events": int(book_row["count"] or 0), "symbols": int(book_row["symbols"] or 0)},
+            "snapshots": {"events": int(snapshot_row["count"] or 0), "symbols": int(snapshot_row["symbols"] or 0)},
+            "one_minute_bars": {"events": int(bar_row["count"] or 0), "symbols": int(bar_row["symbols"] or 0)},
+        }
+
     def upsert_bar(
         self,
         *,
@@ -980,6 +1316,48 @@ class TradingStore:
                 )
             self._conn.commit()
 
+    def upsert_ohlc_bar(
+        self,
+        *,
+        symbol: str,
+        timeframe_minutes: int,
+        start_time: datetime,
+        end_time: datetime,
+        open_price: float,
+        high_price: float,
+        low_price: float,
+        close_price: float,
+        volume: float,
+        source: str = "nova",
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO bars(symbol, timeframe_minutes, start_time, end_time, open, high, low, close, volume, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, timeframe_minutes, start_time) DO UPDATE SET
+                    high = MAX(bars.high, excluded.high),
+                    low = MIN(bars.low, excluded.low),
+                    close = excluded.close,
+                    volume = MAX(bars.volume, excluded.volume),
+                    end_time = excluded.end_time,
+                    source = excluded.source
+                """,
+                (
+                    symbol.upper(),
+                    timeframe_minutes,
+                    _to_text(start_time),
+                    _to_text(end_time),
+                    open_price,
+                    high_price,
+                    low_price,
+                    close_price,
+                    volume,
+                    source,
+                ),
+            )
+            self._conn.commit()
+
     def get_bars_after(self, symbol: str, timeframe_minutes: int, after: datetime, before: datetime | None = None) -> list[sqlite3.Row]:
         params: list[Any] = [symbol.upper(), timeframe_minutes, _to_text(after)]
         sql = """
@@ -1031,6 +1409,12 @@ class TradingStore:
         take_profit: float | None = None,
         strategy_version: str = "",
         candidate_id: int | None = None,
+        entry_order_id: int | None = None,
+        scout_version: str = "",
+        candidate_score: float | None = None,
+        candidate_source: str = "",
+        candidate_reason: str = "",
+        attribution_status: str = "",
         raw_decision: dict[str, Any] | None = None,
         created_at: datetime | None = None,
     ) -> int:
@@ -1059,6 +1443,8 @@ class TradingStore:
                     ).fetchone()
                     if position is not None:
                         raise ValueError("同帳戶同股票已有持倉")
+                    if not strategy_version:
+                        strategy_version = _active_strategy_version(self._conn, strategy)
                     account = self._conn.execute(
                         "SELECT cash, reserved_cash FROM accounts WHERE id = ?",
                         (account_id,),
@@ -1075,22 +1461,51 @@ class TradingStore:
                     )
                 elif side == "sell":
                     position = self._conn.execute(
-                        "SELECT qty FROM positions WHERE account_id = ? AND symbol = ?",
+                        "SELECT * FROM positions WHERE account_id = ? AND symbol = ?",
                         (account_id, symbol),
                     ).fetchone()
                     if position is None:
                         raise ValueError("沒有持倉不可建立賣單")
                     if qty > int(position["qty"]):
                         raise ValueError("賣出股數超過持倉")
+                    if not strategy_version:
+                        strategy_version = _row_text(position, "strategy_version")
+                    if candidate_id is None:
+                        candidate_id = _row_int(position, "candidate_id")
+                    if entry_order_id is None:
+                        entry_order_id = _row_int(position, "entry_order_id")
+                    if not scout_version:
+                        scout_version = _row_text(position, "scout_version")
                 else:
                     raise ValueError("委託買賣別只支援 buy/sell")
 
+                if candidate_id is not None:
+                    candidate = self._conn.execute("SELECT * FROM candidates WHERE id = ?", (candidate_id,)).fetchone()
+                    if candidate is not None:
+                        if not scout_version:
+                            scout_version = _row_text(candidate, "scout_version")
+                        if candidate_score is None:
+                            candidate_score = float(candidate["score"])
+                        if not candidate_source:
+                            candidate_source = str(candidate["source"])
+                        if not candidate_reason:
+                            candidate_reason = str(candidate["reason"])
+                attribution_status = attribution_status or _order_attribution_status(
+                    side=side,
+                    strategy_version=strategy_version,
+                    candidate_id=candidate_id,
+                    entry_order_id=entry_order_id,
+                    candidate_source=candidate_source,
+                    scout_version=scout_version,
+                )
                 cursor = self._conn.execute(
                     """
                     INSERT INTO orders
                         (account_id, strategy, symbol, side, price, qty, status, reason, reserved_cash, candidate_id,
-                         stop_loss, take_profit, strategy_version, created_at, expires_at, raw_decision)
-                    VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         entry_order_id, stop_loss, take_profit, strategy_version, scout_version,
+                         candidate_score, candidate_source, candidate_reason, attribution_status,
+                         created_at, expires_at, raw_decision)
+                    VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         account_id,
@@ -1102,16 +1517,25 @@ class TradingStore:
                         reason,
                         reserved_cash,
                         candidate_id,
+                        entry_order_id,
                         stop_loss,
                         take_profit,
                         strategy_version,
+                        scout_version,
+                        candidate_score,
+                        candidate_source,
+                        candidate_reason,
+                        attribution_status,
                         _to_text(created_at),
                         _to_text(expires_at),
                         json.dumps(raw_decision or {}, ensure_ascii=False),
                     ),
                 )
+                order_id = int(cursor.lastrowid)
+                if side == "buy" and entry_order_id is None:
+                    self._conn.execute("UPDATE orders SET entry_order_id = ? WHERE id = ?", (order_id, order_id))
                 self._conn.commit()
-                return int(cursor.lastrowid)
+                return order_id
             except Exception:
                 self._conn.rollback()
                 raise
@@ -1195,13 +1619,16 @@ class TradingStore:
         filled_at: datetime,
     ) -> None:
         gross = price * qty
+        entry_order_id = order.entry_order_id or (order.id if order.side == "buy" else None)
+        attribution_status = _fill_attribution_status(order, entry_order_id)
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO fills
                     (order_id, account_id, strategy, symbol, side, price, qty, gross_amount,
-                     fee, tax, net_cash_delta, realized_pnl, strategy_version, filled_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     fee, tax, net_cash_delta, realized_pnl, strategy_version, candidate_id,
+                     entry_order_id, scout_version, attribution_status, filled_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order.id,
@@ -1217,6 +1644,10 @@ class TradingStore:
                     net_cash_delta,
                     realized_pnl,
                     order.strategy_version,
+                    order.candidate_id,
+                    entry_order_id,
+                    order.scout_version,
+                    attribution_status,
                     _to_text(filled_at),
                 ),
             )
@@ -1246,7 +1677,16 @@ class TradingStore:
     def get_position(self, account_id: str, symbol: str) -> Position | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM positions WHERE account_id = ? AND symbol = ?",
+                """
+                SELECT p.*,
+                       COALESCE(eo.candidate_score, pc.score) AS candidate_score,
+                       COALESCE(NULLIF(eo.candidate_source, ''), NULLIF(pc.source, ''), '') AS candidate_source,
+                       COALESCE(NULLIF(eo.candidate_reason, ''), NULLIF(pc.reason, ''), '') AS candidate_reason
+                FROM positions p
+                LEFT JOIN orders eo ON eo.id = p.entry_order_id
+                LEFT JOIN candidates pc ON pc.id = p.candidate_id
+                WHERE p.account_id = ? AND p.symbol = ?
+                """,
                 (account_id, symbol.upper()),
             ).fetchone()
         return _position(row) if row else None
@@ -1265,6 +1705,10 @@ class TradingStore:
         stop_loss: float | None,
         take_profit: float | None,
         strategy_version: str = "",
+        candidate_id: int | None = None,
+        entry_order_id: int | None = None,
+        scout_version: str = "",
+        attribution_status: str = "",
         at: datetime,
     ) -> None:
         symbol = symbol.upper()
@@ -1276,12 +1720,18 @@ class TradingStore:
             if side == "buy":
                 if existing is None:
                     avg_cost = (price * qty + fee) / qty
+                    resolved_attribution_status = attribution_status or _position_attribution_status(
+                        strategy_version=strategy_version,
+                        candidate_id=candidate_id,
+                        entry_order_id=entry_order_id,
+                    )
                     self._conn.execute(
                         """
                         INSERT INTO positions
                             (account_id, strategy, symbol, qty, avg_cost, stop_loss, take_profit,
-                             realized_pnl, strategy_version, opened_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                             realized_pnl, strategy_version, candidate_id, entry_order_id,
+                             scout_version, attribution_status, opened_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             account_id,
@@ -1292,6 +1742,10 @@ class TradingStore:
                             stop_loss,
                             take_profit,
                             strategy_version,
+                            candidate_id,
+                            entry_order_id,
+                            scout_version,
+                            resolved_attribution_status,
                             _to_text(at),
                             _to_text(at),
                         ),
@@ -1300,10 +1754,21 @@ class TradingStore:
                     old_qty = int(existing["qty"])
                     new_qty = old_qty + qty
                     avg_cost = ((float(existing["avg_cost"]) * old_qty) + price * qty + fee) / new_qty
+                    resolved_strategy_version = strategy_version or _row_text(existing, "strategy_version")
+                    resolved_candidate_id = candidate_id if candidate_id is not None else _row_int(existing, "candidate_id")
+                    resolved_entry_order_id = entry_order_id if entry_order_id is not None else _row_int(existing, "entry_order_id")
+                    resolved_scout_version = scout_version or _row_text(existing, "scout_version")
+                    resolved_attribution_status = attribution_status or _position_attribution_status(
+                        strategy_version=resolved_strategy_version,
+                        candidate_id=resolved_candidate_id,
+                        entry_order_id=resolved_entry_order_id,
+                    )
                     self._conn.execute(
                         """
                         UPDATE positions
-                        SET qty = ?, avg_cost = ?, stop_loss = ?, take_profit = ?, strategy_version = ?, updated_at = ?
+                        SET qty = ?, avg_cost = ?, stop_loss = ?, take_profit = ?,
+                            strategy_version = ?, candidate_id = ?, entry_order_id = ?,
+                            scout_version = ?, attribution_status = ?, updated_at = ?
                         WHERE account_id = ? AND symbol = ?
                         """,
                         (
@@ -1311,7 +1776,11 @@ class TradingStore:
                             avg_cost,
                             stop_loss,
                             take_profit,
-                            strategy_version or str(existing["strategy_version"] or ""),
+                            resolved_strategy_version,
+                            resolved_candidate_id,
+                            resolved_entry_order_id,
+                            resolved_scout_version,
+                            resolved_attribution_status,
                             _to_text(at),
                             account_id,
                             symbol,
@@ -1345,17 +1814,23 @@ class TradingStore:
             rows = self._conn.execute(
                 """
                 SELECT p.*,
+                       COALESCE(eo.candidate_score, pc.score) AS candidate_score,
+                       COALESCE(NULLIF(eo.candidate_source, ''), NULLIF(pc.source, ''), '') AS candidate_source,
+                       COALESCE(NULLIF(eo.candidate_reason, ''), NULLIF(pc.reason, ''), '') AS candidate_reason,
                        COALESCE(
+                           NULLIF(pc.name, ''),
                            (
-                               SELECT c.name
-                               FROM candidates c
-                               WHERE c.symbol = p.symbol AND c.name <> ''
-                               ORDER BY c.trade_date DESC, c.created_at DESC, c.id DESC
+                               SELECT c2.name
+                               FROM candidates c2
+                               WHERE c2.symbol = p.symbol AND c2.name <> ''
+                               ORDER BY c2.trade_date DESC, c2.created_at DESC, c2.id DESC
                                LIMIT 1
                            ),
                            ''
                        ) AS stock_name
                 FROM positions p
+                LEFT JOIN orders eo ON eo.id = p.entry_order_id
+                LEFT JOIN candidates pc ON pc.id = p.candidate_id
                 ORDER BY p.strategy, p.symbol
                 """
             ).fetchall()
@@ -1366,6 +1841,9 @@ class TradingStore:
             return self._conn.execute(
                 """
                 SELECT f.*,
+                       COALESCE(o.candidate_score, c.score) AS candidate_score,
+                       COALESCE(NULLIF(o.candidate_source, ''), NULLIF(c.source, ''), '') AS candidate_source,
+                       COALESCE(NULLIF(o.candidate_reason, ''), NULLIF(c.reason, ''), '') AS candidate_reason,
                        COALESCE(
                            NULLIF(c.name, ''),
                            (
@@ -1379,7 +1857,7 @@ class TradingStore:
                        ) AS stock_name
                 FROM fills f
                 LEFT JOIN orders o ON o.id = f.order_id
-                LEFT JOIN candidates c ON c.id = o.candidate_id
+                LEFT JOIN candidates c ON c.id = COALESCE(f.candidate_id, o.candidate_id)
                 ORDER BY f.filled_at DESC, f.id DESC
                 LIMIT ?
                 """,
@@ -2106,6 +2584,89 @@ def _account(row: sqlite3.Row) -> Account:
     )
 
 
+def _ensure_columns(conn: sqlite3.Connection, table: str, columns: tuple[tuple[str, str], ...]) -> None:
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, ddl in columns:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
+def _market_event_key(channel: str, symbol: str, event_time: datetime, payload: dict[str, Any]) -> str:
+    source = json.dumps(redact_json(payload), ensure_ascii=False, sort_keys=True, default=str)
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
+    return f"{channel.lower()}:{symbol.upper()}:{_to_text(event_time)}:{digest}"
+
+
+def _level_price(levels: list[dict[str, Any]], index: int) -> float | None:
+    if index >= len(levels):
+        return None
+    value = levels[index].get("price")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _active_strategy_version(conn: sqlite3.Connection, strategy: str) -> str:
+    row = conn.execute(
+        "SELECT active_version FROM strategy_version_state WHERE strategy = ?",
+        (strategy,),
+    ).fetchone()
+    if row is not None and str(row["active_version"] or ""):
+        return str(row["active_version"])
+    return f"{strategy}-v1"
+
+
+def _order_attribution_status(
+    *,
+    side: str,
+    strategy_version: str,
+    candidate_id: int | None,
+    entry_order_id: int | None,
+    candidate_source: str,
+    scout_version: str,
+) -> str:
+    missing: list[str] = []
+    if not strategy_version:
+        missing.append("strategy_version")
+    if candidate_id is None:
+        missing.append("candidate")
+    if side == "sell" and entry_order_id is None:
+        missing.append("entry_order")
+    if candidate_source == "auto_scout" and not scout_version:
+        missing.append("scout_version")
+    return "complete" if not missing else "partial_missing_" + "_".join(missing)
+
+
+def _fill_attribution_status(order: OrderRecord, entry_order_id: int | None) -> str:
+    return _order_attribution_status(
+        side=order.side,
+        strategy_version=order.strategy_version,
+        candidate_id=order.candidate_id,
+        entry_order_id=entry_order_id,
+        candidate_source=order.candidate_source,
+        scout_version=order.scout_version,
+    )
+
+
+def _position_attribution_status(
+    *,
+    strategy_version: str,
+    candidate_id: int | None,
+    entry_order_id: int | None,
+) -> str:
+    missing: list[str] = []
+    if not strategy_version:
+        missing.append("strategy_version")
+    if candidate_id is None:
+        missing.append("candidate")
+    if entry_order_id is None:
+        missing.append("entry_order")
+    return "complete" if not missing else "partial_missing_" + "_".join(missing)
+
+
 def _candidate(row: sqlite3.Row) -> Candidate:
     return Candidate(
         id=int(row["id"]),
@@ -2116,6 +2677,7 @@ def _candidate(row: sqlite3.Row) -> Candidate:
         score=float(row["score"]),
         reason=str(row["reason"]),
         source=str(row["source"]),
+        scout_version=_row_text(row, "scout_version"),
         status=str(row["status"]),
         created_at=_from_text(str(row["created_at"])),
     )
@@ -2133,9 +2695,16 @@ def _order(row: sqlite3.Row) -> OrderRecord:
         status=str(row["status"]),
         reason=str(row["reason"]),
         reserved_cash=float(row["reserved_cash"]),
+        candidate_id=_row_int(row, "candidate_id"),
+        entry_order_id=_row_int(row, "entry_order_id"),
         stop_loss=_optional_float(row["stop_loss"]),
         take_profit=_optional_float(row["take_profit"]),
         strategy_version=_row_text(row, "strategy_version"),
+        scout_version=_row_text(row, "scout_version"),
+        candidate_score=_row_float(row, "candidate_score"),
+        candidate_source=_row_text(row, "candidate_source"),
+        candidate_reason=_row_text(row, "candidate_reason"),
+        attribution_status=_row_text(row, "attribution_status"),
         created_at=_from_text(str(row["created_at"])),
         expires_at=_from_text(str(row["expires_at"])),
     )
@@ -2153,6 +2722,13 @@ def _position(row: sqlite3.Row) -> Position:
         take_profit=_optional_float(row["take_profit"]),
         realized_pnl=float(row["realized_pnl"]),
         strategy_version=_row_text(row, "strategy_version"),
+        candidate_id=_row_int(row, "candidate_id"),
+        entry_order_id=_row_int(row, "entry_order_id"),
+        scout_version=_row_text(row, "scout_version"),
+        candidate_score=_row_float(row, "candidate_score"),
+        candidate_source=_row_text(row, "candidate_source"),
+        candidate_reason=_row_text(row, "candidate_reason"),
+        attribution_status=_row_text(row, "attribution_status"),
         updated_at=_from_text(str(row["updated_at"])),
     )
 
@@ -2187,6 +2763,18 @@ def _strategy_version_state(row: sqlite3.Row) -> StrategyVersionState:
 
 def _optional_float(value: Any) -> float | None:
     return None if value is None else float(value)
+
+
+def _row_int(row: sqlite3.Row, key: str) -> int | None:
+    if key not in row.keys() or row[key] is None:
+        return None
+    return int(row[key])
+
+
+def _row_float(row: sqlite3.Row, key: str) -> float | None:
+    if key not in row.keys() or row[key] is None:
+        return None
+    return float(row[key])
 
 
 def _row_text(row: sqlite3.Row, key: str) -> str:

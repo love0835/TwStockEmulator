@@ -20,7 +20,7 @@ SENSITIVE_KEY_PARTS = (
 )
 
 _KEY_VALUE_RE = re.compile(
-    r"(?i)\b(authorization|authToken|realtimeToken|token|account|certNo|nationalId|pin|password|name)\b\s*[:=]\s*([^\s,;}\]]+)"
+    r"(?i)\b(authorization|authToken|realtimeToken|token|account|certNo|nationalId|national[_-]?id|account[_-]?pass|cert[_-]?pass|cert[_-]?path|TAISHIN_NOVA_USER|TAISHIN_NOVA_PASSWORD|TAISHIN_NOVA_CERT_PASSWORD|pin|password|name)\b\s*[:=]\s*([^\s,;}\]]+)"
 )
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 _TW_ID_RE = re.compile(r"\b[A-Z][12]\d{8}\b")

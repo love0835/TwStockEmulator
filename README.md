@@ -139,13 +139,39 @@ Demo 模式可測多種立即檢討：
 
 ```text
 dist\TwWatchDesk.exe
+dist\TwWatchDeskSetup.exe
 ```
+
+## 移機 / Nova 環境精靈
+
+換電腦或重建環境時，先執行：
+
+```text
+dist\TwWatchDeskSetup.exe
+```
+
+這個精靈會在同一個視窗完成：
+
+- 檢查並匯入台新憑證檔，預設複製到本機 `data/certs/`。
+- 寫入 TwWatchDesk 使用的 `.env.local`。
+- 驗證 `taishin_sdk`、Nova `login`、帳戶取得與 `initRealtime`。
+- 視需要呼叫 `registerApiAuth` 確認 / 開通 Nova API 權限。
+- 檢查 Node.js / npm；缺少時可透過 winget 安裝 Node.js LTS。
+- 安裝 / 更新 `@fugle/mcp-server@0.1.1`。
+- 寫入 Codex 的 `[mcp_servers.fugle]` 與 `[mcp_servers.fugle.env]` 設定。
+- 執行 Fugle MCP `initialize` / `tools/list` smoke test。
+
+安全邊界：
+
+- MCP 設定固定寫入 `ENABLE_ORDER=false`，不開啟真實下單。
+- 視窗 log 會遮蔽身分證字號、登入密碼、憑證密碼與憑證路徑。
+- 台新憑證下載 / 申請仍走台新官方互動頁面；精靈提供入口並驗證匯出的 `.pfx` / `.p12`，不在背景代填台新網站。
 
 ## Nova 設定
 
 開啟程式後按右上角 `台新 API 設定`，可以直接填入並儲存身分證字號、登入密碼、憑證路徑與憑證密碼。登入後會依台新 SDK 回傳結果使用第一個帳戶；第一版不手動輸入交易帳號。設定會寫入 `.env.local`，不要提交到 Git。
 
-Python 版 Nova SDK 不是 PyPI 套件，專案依賴已固定使用台新官方 Windows wheel。執行 `scripts\build_exe.ps1` 時會安裝並打包 `taishin_sdk`。
+Python 版 Nova SDK 不是 PyPI 套件，專案依賴已固定使用台新官方 Windows wheel。執行 `scripts\build_exe.ps1` 時會安裝並打包 `taishin_sdk` 到 `TwWatchDesk.exe` 與 `TwWatchDeskSetup.exe`。
 
 程式也支援手動編輯 `.env.local`，會依序搜尋：
 

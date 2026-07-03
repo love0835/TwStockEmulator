@@ -202,6 +202,128 @@ def test_stock_names_are_available_for_orders_fills_and_positions(tmp_path) -> N
     assert store.stock_name_map()["2330"] == "台積電"
 
 
+def test_order_fill_and_position_keep_attribution_snapshot(tmp_path) -> None:
+    store = TradingStore(tmp_path / "lab.sqlite3")
+    store.initialize()
+    now = datetime(2026, 7, 2, 1, 10, tzinfo=timezone.utc)
+    candidate_id = store.upsert_candidate(
+        trade_date="2026-07-02",
+        strategy="daytrade",
+        symbol="2330",
+        name="台積電",
+        score=88,
+        reason="first scout result",
+        source="auto_scout",
+        scout_version="scout-v1",
+        created_at=now,
+    )
+
+    order_id = store.create_order(
+        account_id=DAYTRADE_ACCOUNT,
+        strategy="daytrade",
+        symbol="2330",
+        side="buy",
+        price=100,
+        qty=1000,
+        reason="entry",
+        expires_at=now + timedelta(minutes=5),
+        candidate_id=candidate_id,
+        created_at=now,
+    )
+    order = store.get_order(order_id)
+    store.record_fill(order=order, price=100, qty=1000, fee=142.5, tax=0, net_cash_delta=-100_142.5, realized_pnl=0, filled_at=now)
+    store.upsert_position_after_fill(
+        account_id=DAYTRADE_ACCOUNT,
+        strategy="daytrade",
+        symbol="2330",
+        side="buy",
+        qty=1000,
+        price=100,
+        fee=142.5,
+        realized_pnl=0,
+        stop_loss=98,
+        take_profit=103,
+        strategy_version=order.strategy_version,
+        candidate_id=order.candidate_id,
+        entry_order_id=order.id,
+        scout_version=order.scout_version,
+        attribution_status=order.attribution_status,
+        at=now,
+    )
+
+    store.upsert_candidate(
+        trade_date="2026-07-02",
+        strategy="daytrade",
+        symbol="2330",
+        name="台積電",
+        score=10,
+        reason="rerun should not rewrite order snapshot",
+        source="auto_scout",
+        scout_version="scout-v2",
+        created_at=now + timedelta(minutes=1),
+    )
+
+    saved_order = store.list_orders()[0]
+    assert saved_order["candidate_id"] == candidate_id
+    assert saved_order["entry_order_id"] == order_id
+    assert saved_order["strategy_version"] == "daytrade-v1"
+    assert saved_order["scout_version"] == "scout-v1"
+    assert saved_order["candidate_score"] == 88
+    assert saved_order["candidate_reason"] == "first scout result"
+    assert saved_order["attribution_status"] == "complete"
+    saved_fill = store.list_fills()[0]
+    assert saved_fill["candidate_id"] == candidate_id
+    assert saved_fill["entry_order_id"] == order_id
+    assert saved_fill["scout_version"] == "scout-v1"
+    assert saved_fill["candidate_source"] == "auto_scout"
+    assert saved_fill["candidate_reason"] == "first scout result"
+    assert saved_fill["attribution_status"] == "complete"
+    position = store.get_position(DAYTRADE_ACCOUNT, "2330")
+    assert position.candidate_id == candidate_id
+    assert position.entry_order_id == order_id
+    assert position.scout_version == "scout-v1"
+    assert position.candidate_source == "auto_scout"
+    assert position.candidate_reason == "first scout result"
+    assert position.attribution_status == "complete"
+
+
+def test_sell_from_unattributed_position_does_not_backfill_active_strategy(tmp_path) -> None:
+    store = TradingStore(tmp_path / "lab.sqlite3")
+    store.initialize()
+    now = datetime(2026, 7, 2, 1, 10, tzinfo=timezone.utc)
+    store.upsert_position_after_fill(
+        account_id=DAYTRADE_ACCOUNT,
+        strategy="daytrade",
+        symbol="2330",
+        side="buy",
+        qty=1000,
+        price=100,
+        fee=0,
+        realized_pnl=0,
+        stop_loss=98,
+        take_profit=103,
+        at=now,
+    )
+
+    sell_id = store.create_order(
+        account_id=DAYTRADE_ACCOUNT,
+        strategy="daytrade",
+        symbol="2330",
+        side="sell",
+        price=101,
+        qty=1000,
+        reason="legacy exit",
+        expires_at=now + timedelta(minutes=5),
+        created_at=now,
+    )
+
+    sell_order = store.get_order(sell_id)
+    assert sell_order.strategy_version == ""
+    assert sell_order.candidate_id is None
+    assert sell_order.entry_order_id is None
+    assert sell_order.attribution_status == "partial_missing_strategy_version_candidate_entry_order"
+
+
 def test_monitor_events_filter_and_persist(tmp_path) -> None:
     db_path = tmp_path / "lab.sqlite3"
     store = TradingStore(db_path)
@@ -241,6 +363,48 @@ def test_monitor_events_filter_and_persist(tmp_path) -> None:
     persisted = reopened.list_monitor_events(strategy="daytrade")
     assert persisted[0]["id"] == event_id
     assert persisted[0]["symbol"] == "2330"
+
+
+def test_realtime_market_data_events_ticks_and_books_persist(tmp_path) -> None:
+    store = TradingStore(tmp_path / "lab.sqlite3")
+    store.initialize()
+    at = datetime(2026, 7, 2, 1, 10, tzinfo=timezone.utc)
+
+    store.insert_market_data_event(
+        channel="trades",
+        symbol="2330",
+        exchange_time=at,
+        received_at=at + timedelta(seconds=1),
+        payload={"symbol": "2330", "price": 100, "size": 5},
+        event_key="trade-1",
+    )
+    store.insert_market_tick(
+        symbol="2330",
+        trade_time=at,
+        received_at=at + timedelta(seconds=1),
+        price=100,
+        size=5,
+        bid=99.5,
+        ask=100,
+        volume=10_000,
+        serial="1",
+        side="ask",
+        raw={"channel": "trades"},
+        event_key="trade-1",
+    )
+    store.insert_order_book(
+        symbol="2330",
+        exchange_time=at,
+        received_at=at + timedelta(seconds=1),
+        bids=[{"price": 99.5, "size": 10}],
+        asks=[{"price": 100, "size": 8}],
+        raw={"channel": "books"},
+        event_key="book-1",
+    )
+
+    assert store.count_market_data_events("trades", "2330") == 1
+    assert store.get_ticks_after("2330", at - timedelta(seconds=1))[0]["price"] == 100
+    assert store.latest_order_book("2330")["best_bid"] == 99.5
 
 
 def test_strategy_versions_initialize_and_manual_lock_persists(tmp_path) -> None:
