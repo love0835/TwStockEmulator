@@ -1117,6 +1117,13 @@ class WatchDeskApp:
             version = self.store.get_strategy_version(strategy, selected[0])
             params = "\n".join(f"{key}: {value}" for key, value in version.params.items())
             metrics = "\n".join(f"{key}: {value}" for key, value in version.metrics.items()) or "-"
+            param_diff = "-"
+            if version.parent_version:
+                try:
+                    parent_version = self.store.get_strategy_version(strategy, version.parent_version)
+                    param_diff = _format_param_diff(parent_version.params, version.params)
+                except KeyError:
+                    param_diff = "找不到父版本，無法比對。"
             version_text = (
                 f"版本：{version.version}\n"
                 f"父版本：{version.parent_version or '-'}\n"
@@ -1125,6 +1132,7 @@ class WatchDeskApp:
                 f"啟用：{_format_time(version.activated_at, self.settings.timezone)}\n"
                 f"資料區間：{version.data_start or '-'} ~ {version.data_end or '-'}\n\n"
                 f"參數\n{params}\n\n"
+                f"與前版差異\n{param_diff}\n\n"
                 f"規則文字\n{version.rules_text or '-'}\n\n"
                 f"討論過程\n{version.discussion or '-'}\n\n"
                 f"績效/產生資訊\n{metrics}"
@@ -1202,6 +1210,10 @@ class WatchDeskApp:
             for event_row in self.store.list_monitor_events(trade_date=trade_date, strategy=strategy, min_severity=None, limit=300)
             if str(event_row["phase"]) == "daily_review" or "review" in str(event_row["event_type"])
         ]
+        review_run_id = _review_run_id_from_metrics(row["metrics_json"])
+        agent_reviews = self.store.list_agent_reviews(review_run_id) if review_run_id else []
+        strategy_proposals = self.store.list_strategy_proposals(review_run_id) if review_run_id else []
+        news_contexts = self.store.list_news_context_reviews(review_run_id) if review_run_id else []
         window = Toplevel(self.root)
         window.title(f"每日檢討 Log：{trade_date} {_strategy_label(strategy)}")
         window.geometry("900x650")
@@ -1217,7 +1229,7 @@ class WatchDeskApp:
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         text.configure(yscrollcommand=scrollbar.set)
-        text.insert("1.0", _format_daily_review_detail(row, events, self.settings.timezone))
+        text.insert("1.0", _format_daily_review_detail(row, events, agent_reviews, strategy_proposals, news_contexts, self.settings.timezone))
         text.configure(state="disabled")
         ttk.Button(frame, text="關閉", command=window.destroy).grid(row=1, column=0, sticky="e", pady=(8, 0))
         window.focus_set()
@@ -1289,7 +1301,14 @@ def _format_latest_strategy_review(row: object, timezone_name: str) -> str:
     )
 
 
-def _format_daily_review_detail(row: object, events: list[object], timezone_name: str) -> str:
+def _format_daily_review_detail(
+    row: object,
+    events: list[object],
+    agent_reviews: list[object],
+    strategy_proposals: list[object],
+    news_contexts: list[object],
+    timezone_name: str,
+) -> str:
     event_lines = []
     for event in events:
         event_lines.append(
@@ -1305,6 +1324,9 @@ def _format_daily_review_detail(row: object, events: list[object], timezone_name
             )
         )
     event_text = "\n\n".join(event_lines) if event_lines else "-"
+    agent_text = _format_agent_reviews(agent_reviews, timezone_name)
+    proposal_text = _format_strategy_proposals(strategy_proposals)
+    news_text = _format_news_contexts(news_contexts)
     return (
         f"每日檢討 Log\n"
         f"交易日：{row['review_date']}\n"
@@ -1317,8 +1339,80 @@ def _format_daily_review_detail(row: object, events: list[object], timezone_name
         f"LLM 摘要\n{row['llm_summary'] or '-'}\n\n"
         f"檢討過程 / 失敗原因\n{row['llm_discussion'] or '-'}\n\n"
         f"LLM 原始結果\n{_format_json_text(row['llm_result_json'])}\n\n"
+        f"Agent 檢討\n{agent_text}\n\n"
+        f"策略提案 / 驗證\n{proposal_text}\n\n"
+        f"新聞 / 公告背景（context-only）\n{news_text}\n\n"
         f"相關監控事件\n{event_text}"
     )
+
+
+def _format_agent_reviews(rows: list[object], timezone_name: str) -> str:
+    if not rows:
+        return "-"
+    lines = []
+    for row in rows:
+        output = _format_json_text(row["output_json"])
+        lines.append(
+            "\n".join(
+                [
+                    f"- {_format_db_time(row['created_at'], timezone_name)} {row['agent_name']}",
+                    f"  狀態：{row['status']}；動作：{row['action'] or '-'}；信心：{row['confidence'] if row['confidence'] is not None else '-'}",
+                    f"  evidence_quality：{row['evidence_quality'] or '-'}",
+                    f"  output_hash：{row['output_hash'] or '-'}",
+                    f"  摘要/JSON：{output}",
+                ]
+            )
+        )
+    return "\n\n".join(lines)
+
+
+def _format_strategy_proposals(rows: list[object]) -> str:
+    if not rows:
+        return "-"
+    lines = []
+    for row in rows:
+        lines.append(
+            "\n".join(
+                [
+                    f"- {_strategy_label(row['strategy'])}：{_proposal_status_label(row['status'])}",
+                    f"  摘要：{row['summary'] or '-'}",
+                    f"  strategy_version_id：{row['strategy_version_id'] or '-'}",
+                    f"  proposed_params：{_format_json_text(row['proposed_params_json'])}",
+                    f"  validation：{_format_json_text(row['validation_json'])}",
+                    f"  replay：{_format_json_text(row['replay_json'])}",
+                    f"  risk_gate：{_format_json_text(row['risk_gate_json'])}",
+                ]
+            )
+        )
+    return "\n\n".join(lines)
+
+
+def _format_news_contexts(rows: list[object]) -> str:
+    if not rows:
+        return "-"
+    lines = []
+    for row in rows:
+        lines.append(
+            "\n".join(
+                [
+                    f"- {row['symbol']}：{row['summary'] or '-'}",
+                    f"  狀態：{row['status']}",
+                    f"  sources：{_format_json_text(row['source_urls_json'])}",
+                    f"  context：{_format_json_text(row['context_json'])}",
+                ]
+            )
+        )
+    return "\n\n".join(lines)
+
+
+def _format_param_diff(parent: dict[str, object], current: dict[str, object]) -> str:
+    lines = []
+    for key in sorted(set(parent) | set(current)):
+        old = parent.get(key)
+        new = current.get(key)
+        if old != new:
+            lines.append(f"{key}: {old} -> {new}")
+    return "\n".join(lines) if lines else "無參數差異"
 
 
 def _format_json_text(value: object) -> str:
@@ -1329,6 +1423,21 @@ def _format_json_text(value: object) -> str:
         return json.dumps(json.loads(text), ensure_ascii=False, indent=2)
     except json.JSONDecodeError:
         return text
+
+
+def _review_run_id_from_metrics(value: object) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    try:
+        review_run_id = int(payload.get("review_run_id", 0))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return review_run_id or None
 
 
 def _format_json_flags(value: object) -> str:
