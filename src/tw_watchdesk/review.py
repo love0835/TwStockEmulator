@@ -149,6 +149,9 @@ class MultiAgentReviewOrchestrator:
         created_at = created_at or datetime.now(timezone.utc)
         built = self.evidence_builder.build(review_date, created_at=created_at)
         run_key = f"{review_date}:multi_agent_strategy_review:{built.evidence_hash[:12]}"
+        lease_owner = f"{self.backend.backend_name}:{created_at.isoformat()}"
+        if not self.store.acquire_review_run_lease(run_key=run_key, owner=lease_owner, now=created_at):
+            raise RuntimeError(f"review run already in progress: {run_key}")
         review_run_id = self.store.create_review_run(
             run_key=run_key,
             review_date=review_date,
@@ -194,6 +197,8 @@ class MultiAgentReviewOrchestrator:
             message = redact_text(str(exc))
             self.store.update_review_run(review_run_id, status="error", result={"error": message}, error=message)
             raise
+        finally:
+            self.store.release_review_run_lease(run_key=run_key, owner=lease_owner)
 
     def _run_strategy_agent(self, review_run_id: int, strategy: str, built: BuiltEvidence) -> dict[str, Any]:
         agent_name = CORE_AGENT_NAMES[strategy]

@@ -1695,6 +1695,50 @@ class TradingStore:
             self._conn.commit()
             return int(cursor.lastrowid)
 
+    def acquire_review_run_lease(
+        self,
+        *,
+        run_key: str,
+        owner: str,
+        ttl_seconds: int = 600,
+        now: datetime | None = None,
+    ) -> bool:
+        now = now or utc_now()
+        expires_at = now + timedelta(seconds=ttl_seconds)
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT * FROM review_run_leases WHERE run_key = ?",
+                (run_key,),
+            ).fetchone()
+            if existing is not None:
+                try:
+                    existing_expires = _from_text(str(existing["expires_at"]))
+                except ValueError:
+                    existing_expires = now - timedelta(seconds=1)
+                if existing_expires > now:
+                    return False
+            self._conn.execute(
+                """
+                INSERT INTO review_run_leases(run_key, owner, expires_at, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(run_key) DO UPDATE SET
+                    owner = excluded.owner,
+                    expires_at = excluded.expires_at,
+                    created_at = excluded.created_at
+                """,
+                (run_key, owner, _to_text(expires_at), _to_text(now)),
+            )
+            self._conn.commit()
+            return True
+
+    def release_review_run_lease(self, *, run_key: str, owner: str | None = None) -> None:
+        with self._lock:
+            if owner is None:
+                self._conn.execute("DELETE FROM review_run_leases WHERE run_key = ?", (run_key,))
+            else:
+                self._conn.execute("DELETE FROM review_run_leases WHERE run_key = ? AND owner = ?", (run_key, owner))
+            self._conn.commit()
+
     def update_review_run(
         self,
         review_run_id: int,

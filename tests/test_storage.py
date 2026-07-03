@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -274,6 +274,18 @@ def test_strategy_versions_initialize_and_manual_lock_persists(tmp_path) -> None
     reopened.initialize()
     assert [version.version for version in reopened.list_strategy_versions("swing", limit=None)] == ["swing-v2", "swing-v1"]
     assert reopened.get_strategy_version_state("swing").active_version == "swing-v1"
+
+
+def test_review_run_lease_blocks_duplicate_until_release_or_expiry(tmp_path) -> None:
+    store = TradingStore(tmp_path / "lab.sqlite3")
+    store.initialize()
+    now = datetime(2026, 7, 3, 6, 30, tzinfo=timezone.utc)
+
+    assert store.acquire_review_run_lease(run_key="unit", owner="a", ttl_seconds=60, now=now) is True
+    assert store.acquire_review_run_lease(run_key="unit", owner="b", ttl_seconds=60, now=now + timedelta(seconds=10)) is False
+    assert store.acquire_review_run_lease(run_key="unit", owner="b", ttl_seconds=60, now=now + timedelta(seconds=61)) is True
+    store.release_review_run_lease(run_key="unit", owner="b")
+    assert store.acquire_review_run_lease(run_key="unit", owner="c", ttl_seconds=60, now=now + timedelta(seconds=62)) is True
 
 
 def test_quote_diagnostic_persists_structured_reason(tmp_path) -> None:
