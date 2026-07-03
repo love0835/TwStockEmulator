@@ -1,0 +1,35 @@
+[project]
+name = "tw-watchdesk"
+version = "0.1.0"
+description = "獨立台股即時看盤桌面程式"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "taishin-sdk @ https://ml-fugle-api.tssco.com.tw/FugleSDK/sdk/taishin_sdk-1.0.2-cp37-abi3-win_amd64.whl",
+    "tzdata>=2025.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+]
+build = [
+    "pyinstaller>=6.10.0",
+]
+
+[project.scripts]
+tw-watchdesk = "tw_watchdesk.app:main"
+
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tw_watchdesk"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
