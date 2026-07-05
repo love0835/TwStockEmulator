@@ -254,14 +254,25 @@ def test_redact_setup_text_hides_short_passwords_and_cert_paths() -> None:
     assert "nova.pfx" not in redacted
 
 
-def test_mcp_message_roundtrip_uses_content_length_frames() -> None:
+def test_mcp_message_roundtrip_uses_newline_json_frames() -> None:
     stream = BytesIO()
     payload = {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
 
     send_mcp_message(stream, payload)
+    assert stream.getvalue().endswith(b"\n")
+    assert b"Content-Length" not in stream.getvalue()
     stream.seek(0)
 
     assert read_mcp_message(stream, timeout_seconds=1) == payload
+
+
+def test_read_mcp_message_skips_notifications_until_expected_id() -> None:
+    stream = BytesIO()
+    stream.write(b'{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n')
+    stream.write(b'{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}\n')
+    stream.seek(0)
+
+    assert read_mcp_message(stream, timeout_seconds=1, expected_id=1)["id"] == 1
 
 
 def test_call_with_timeout_raises_instead_of_blocking_forever() -> None:

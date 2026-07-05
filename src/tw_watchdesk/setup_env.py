@@ -563,12 +563,12 @@ def verify_fugle_mcp(command: str, env_values: dict[str, str], timeout_seconds: 
                 },
             },
         )
-        initialize = read_mcp_message(process.stdout, timeout_seconds=timeout_seconds)
+        initialize = read_mcp_message(process.stdout, timeout_seconds=timeout_seconds, expected_id=1)
         if initialize.get("error"):
             return StepResult("Fugle MCP smoke", "error", redact_text(f"MCP initialize 失敗：{json.dumps(initialize.get('error'), ensure_ascii=False)}"))
         send_mcp_message(process.stdin, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
         send_mcp_message(process.stdin, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-        tools = read_mcp_message(process.stdout, timeout_seconds=timeout_seconds)
+        tools = read_mcp_message(process.stdout, timeout_seconds=timeout_seconds, expected_id=2)
         if tools.get("error"):
             return StepResult("Fugle MCP smoke", "error", redact_text(f"MCP tools/list 失敗：{json.dumps(tools.get('error'), ensure_ascii=False)}"))
         tool_count = len((tools.get("result") or {}).get("tools") or [])
@@ -587,15 +587,13 @@ def verify_fugle_mcp(command: str, env_values: dict[str, str], timeout_seconds: 
 
 
 def send_mcp_message(stream: object, payload: dict[str, object]) -> None:
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    header = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
-    stream.write(header + body)  # type: ignore[attr-defined]
+    body = (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    stream.write(body)  # type: ignore[attr-defined]
     stream.flush()  # type: ignore[attr-defined]
 
 
-def read_mcp_message(stream: object, timeout_seconds: int) -> dict[str, object]:
+def read_mcp_message(stream: object, timeout_seconds: int, expected_id: int | None = None) -> dict[str, object]:
     start = time.monotonic()
-    headers: dict[str, str] = {}
     while True:
         remaining = timeout_seconds - (time.monotonic() - start)
         if remaining <= 0:
@@ -603,20 +601,11 @@ def read_mcp_message(stream: object, timeout_seconds: int) -> dict[str, object]:
         line = call_with_timeout(lambda: stream.readline(), remaining)  # type: ignore[attr-defined]
         if not line:
             raise RuntimeError("MCP server closed stdout")
-        decoded = line.decode("ascii", errors="replace").strip()
-        if not decoded:
-            break
-        if ":" in decoded:
-            key, value = decoded.split(":", 1)
-            headers[key.lower()] = value.strip()
-    length = int(headers.get("content-length", "0"))
-    if length <= 0:
-        raise RuntimeError("MCP response 缺少 Content-Length")
-    remaining = timeout_seconds - (time.monotonic() - start)
-    if remaining <= 0:
-        raise TimeoutError("等待 MCP response body 逾時")
-    body = call_with_timeout(lambda: stream.read(length), remaining)  # type: ignore[attr-defined]
-    return json.loads(body.decode("utf-8"))
+        decoded = line.decode("utf-8", errors="replace").strip()
+        if decoded:
+            message = json.loads(decoded)
+            if expected_id is None or message.get("id") == expected_id:
+                return message
 
 
 def call_with_timeout(action: Callable[[], bytes], timeout_seconds: float) -> bytes:
@@ -652,6 +641,18 @@ def collect_process_stderr(process: subprocess.Popen[bytes]) -> str:
 
 def terminate_process(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
         return
     process.terminate()
     try:
