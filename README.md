@@ -156,6 +156,7 @@ dist\TwWatchDeskSetup.exe
 - 寫入 TwWatchDesk 使用的 `.env.local`。
 - 驗證 `taishin_sdk`、Nova `login`、帳戶取得與 `initRealtime`。
 - 視需要呼叫 `registerApiAuth` 確認 / 開通 Nova API 權限。
+- 檢查 LLM backend 環境；`codex_cli` 會確認 Codex CLI 在 PATH、可執行 `--version`，且 `codex login status` 已登入；`openai_api` / `anthropic_api` 會確認必要 API key 已設定。
 - 檢查 Node.js / npm；缺少時可透過 winget 安裝 Node.js LTS。
 - 安裝 / 更新 `@fugle/mcp-server@0.1.1`。
 - 寫入 Codex 的 `[mcp_servers.fugle]` 與 `[mcp_servers.fugle.env]` 設定。

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal
 
-from tw_watchdesk.config import default_settings_file, save_nova_settings
+from tw_watchdesk.config import default_settings_file, load_settings, save_nova_settings
 from tw_watchdesk.redaction import redact_text
 
 
@@ -24,6 +24,9 @@ TAISHIN_CERT_CENTER_URL = "https://www.tssco.com.tw/CAinfo/"
 TAISHIN_NOVA_PREPARE_URL = "https://ml-fugle-api.masterlink.com.tw/FugleSDK/docs/trading/prepare/"
 NODE_WINGET_ID = "OpenJS.NodeJS.LTS"
 MCP_PROTOCOL_VERSION = "2024-11-05"
+CODEX_LLM_BACKENDS = {"", "codex", "codex_cli"}
+OPENAI_LLM_BACKENDS = {"openai", "openai_api", "openai_responses_api"}
+ANTHROPIC_LLM_BACKENDS = {"anthropic", "anthropic_api", "anthropic_messages_api"}
 
 StepStatus = Literal["ok", "warning", "error", "skipped"]
 ProgressCallback = Callable[["StepResult"], None]
@@ -45,6 +48,7 @@ class SetupOptions:
     configure_codex_mcp: bool = True
     verify_mcp: bool = True
     verify_nova: bool = True
+    verify_llm: bool = True
     register_api_auth: bool = True
     copy_certificate: bool = True
     enable_order: bool = False
@@ -105,6 +109,9 @@ def run_full_setup(
     emit(env_result)
     if env_result.status == "error":
         return results
+
+    if options.verify_llm:
+        emit(verify_llm_environment(base_dir))
 
     if options.verify_nova:
         nova_result = verify_nova_login(
@@ -381,6 +388,72 @@ def install_or_update_fugle_mcp(npm_path: str | None) -> StepResult:
     return StepResult("Fugle MCP 安裝", "ok", f"已安裝 {FUGLE_MCP_PACKAGE}：{command}")
 
 
+def verify_llm_environment(base_dir: Path | None = None) -> StepResult:
+    settings = load_settings(base_dir or _app_base_for_setup())
+    backend = (settings.llm_backend or "codex_cli").strip().lower()
+    model = settings.codex_model or "gpt-5.5"
+
+    if backend in CODEX_LLM_BACKENDS:
+        command = find_codex_cli_command()
+        if not command:
+            return StepResult(
+                "LLM 環境",
+                "error",
+                "TW_WATCH_LLM_BACKEND=codex_cli，但 PATH 找不到 Codex CLI。",
+                "請安裝 Codex CLI / Codex Desktop，確認 PowerShell 可執行 `codex --version` 後重跑 setup。",
+            )
+        version_result = run_subprocess([command, "--version"], timeout_seconds=20)
+        version = (version_result.stdout or version_result.stderr or "").strip()
+        if version_result.returncode != 0:
+            return StepResult(
+                "LLM 環境",
+                "error",
+                f"Codex CLI 已找到但無法執行 --version：{command}",
+                "請重新安裝 Codex CLI，或確認 `codex --version` 在 PowerShell 可正常執行。",
+            )
+        login_result = run_subprocess([command, "login", "status"], timeout_seconds=20)
+        if login_result.returncode != 0:
+            detail = redact_text((login_result.stderr or login_result.stdout or "").strip())
+            remediation = "請在 PowerShell 執行 `codex login`，或開啟 Codex Desktop 完成登入後重跑 setup。"
+            if detail:
+                remediation += f" CLI 訊息：{detail}"
+            return StepResult(
+                "LLM 環境",
+                "error",
+                f"Codex CLI 可啟動但登入狀態未通過：{command}",
+                remediation,
+            )
+        version_text = f"；版本：{version}" if version else ""
+        return StepResult("LLM 環境", "ok", f"Codex CLI 可用：{command}{version_text}；登入狀態已確認；model={model}。")
+
+    if backend in OPENAI_LLM_BACKENDS:
+        if not settings.openai_api_key:
+            return StepResult(
+                "LLM 環境",
+                "error",
+                f"TW_WATCH_LLM_BACKEND={backend}，但 OPENAI_API_KEY 未設定。",
+                "請在 .env.local 或系統環境變數設定 OPENAI_API_KEY，或改回 TW_WATCH_LLM_BACKEND=codex_cli。",
+            )
+        return StepResult("LLM 環境", "ok", f"OpenAI API key 已設定；backend={backend}；model={model}；未做網路呼叫。")
+
+    if backend in ANTHROPIC_LLM_BACKENDS:
+        if not settings.anthropic_api_key:
+            return StepResult(
+                "LLM 環境",
+                "error",
+                f"TW_WATCH_LLM_BACKEND={backend}，但 ANTHROPIC_API_KEY 未設定。",
+                "請在 .env.local 或系統環境變數設定 ANTHROPIC_API_KEY，或改回 TW_WATCH_LLM_BACKEND=codex_cli。",
+            )
+        return StepResult("LLM 環境", "ok", f"Anthropic API key 已設定；backend={backend}；model={model}；未做網路呼叫。")
+
+    return StepResult(
+        "LLM 環境",
+        "error",
+        f"未知 LLM backend：{backend}",
+        "支援值：codex_cli、openai_api、anthropic_api。",
+    )
+
+
 def update_codex_fugle_config(
     config_path: Path,
     credentials: SetupCredentials,
@@ -592,6 +665,16 @@ def find_fugle_mcp_command() -> str | None:
     if candidates:
         return candidates[0]
     return find_command("fugle-mcp-server")
+
+
+def find_codex_cli_command() -> str | None:
+    if os.name == "nt":
+        for name in ("codex.cmd", "codex.exe", "codex"):
+            command = find_command(name)
+            if command:
+                return command
+        return None
+    return find_command("codex")
 
 
 def find_command(name: str) -> str | None:

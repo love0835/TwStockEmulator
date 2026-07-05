@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import subprocess
 import time
 from io import BytesIO
 
 import pytest
 
+import tw_watchdesk.setup_env as setup_env
 from tw_watchdesk.setup_env import (
     SetupCredentials,
     build_fugle_mcp_env,
@@ -15,6 +17,7 @@ from tw_watchdesk.setup_env import (
     replace_fugle_mcp_block,
     send_mcp_message,
     validate_setup_inputs,
+    verify_llm_environment,
 )
 
 
@@ -115,6 +118,80 @@ def test_build_fugle_mcp_env_defaults_orders_disabled() -> None:
     assert env["NATIONAL_ID"] == "A123456789"
 
 
+def test_verify_llm_environment_accepts_codex_cli_login(tmp_path, monkeypatch) -> None:
+    _clear_llm_process_env(monkeypatch)
+    (tmp_path / ".env.local").write_text(
+        "TW_WATCH_LLM_BACKEND=codex_cli\nTW_WATCH_CODEX_MODEL=gpt-test\n",
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    def fake_run_subprocess(args: list[str], timeout_seconds: int) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        if args[-1] == "--version":
+            return subprocess.CompletedProcess(args, 0, stdout="codex-cli 0.125.0\n", stderr="")
+        if args[-2:] == ["login", "status"]:
+            return subprocess.CompletedProcess(args, 0, stdout="Logged in using ChatGPT\n", stderr="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(setup_env, "find_codex_cli_command", lambda: r"C:\node\codex.cmd")
+    monkeypatch.setattr(setup_env, "run_subprocess", fake_run_subprocess)
+
+    result = verify_llm_environment(tmp_path)
+
+    assert result.status == "ok"
+    assert r"C:\node\codex.cmd" in result.detail
+    assert "codex-cli 0.125.0" in result.detail
+    assert "gpt-test" in result.detail
+    assert "Logged in" not in result.detail
+    assert calls == [[r"C:\node\codex.cmd", "--version"], [r"C:\node\codex.cmd", "login", "status"]]
+
+
+def test_verify_llm_environment_errors_when_codex_missing(tmp_path, monkeypatch) -> None:
+    _clear_llm_process_env(monkeypatch)
+    (tmp_path / ".env.local").write_text("TW_WATCH_LLM_BACKEND=codex_cli\n", encoding="utf-8")
+    monkeypatch.setattr(setup_env, "find_codex_cli_command", lambda: None)
+
+    result = verify_llm_environment(tmp_path)
+
+    assert result.status == "error"
+    assert "找不到 Codex CLI" in result.detail
+    assert "codex --version" in result.remediation
+
+
+def test_verify_llm_environment_errors_when_codex_not_logged_in(tmp_path, monkeypatch) -> None:
+    _clear_llm_process_env(monkeypatch)
+    (tmp_path / ".env.local").write_text("TW_WATCH_LLM_BACKEND=codex_cli\n", encoding="utf-8")
+
+    def fake_run_subprocess(args: list[str], timeout_seconds: int) -> subprocess.CompletedProcess[str]:
+        if args[-1] == "--version":
+            return subprocess.CompletedProcess(args, 0, stdout="codex-cli 0.125.0\n", stderr="")
+        if args[-2:] == ["login", "status"]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="Not logged in\n")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(setup_env, "find_codex_cli_command", lambda: r"C:\node\codex.cmd")
+    monkeypatch.setattr(setup_env, "run_subprocess", fake_run_subprocess)
+
+    result = verify_llm_environment(tmp_path)
+
+    assert result.status == "error"
+    assert "登入狀態未通過" in result.detail
+    assert "codex login" in result.remediation
+    assert "Not logged in" in result.remediation
+
+
+def test_verify_llm_environment_requires_openai_api_key(tmp_path, monkeypatch) -> None:
+    _clear_llm_process_env(monkeypatch)
+    (tmp_path / ".env.local").write_text("TW_WATCH_LLM_BACKEND=openai_api\n", encoding="utf-8")
+
+    result = verify_llm_environment(tmp_path)
+
+    assert result.status == "error"
+    assert "OPENAI_API_KEY" in result.detail
+    assert "OPENAI_API_KEY" in result.remediation
+
+
 def test_redact_setup_text_hides_short_passwords_and_cert_paths() -> None:
     creds = credentials(r"C:\Users\me\Desktop\nova.pfx")
     text = "NATIONAL_ID=A123456789 ACCOUNT_PASS=shortpw CERT_PASS=certpw CERT_PATH=C:\\Users\\me\\Desktop\\nova.pfx"
@@ -140,3 +217,13 @@ def test_mcp_message_roundtrip_uses_content_length_frames() -> None:
 def test_call_with_timeout_raises_instead_of_blocking_forever() -> None:
     with pytest.raises(TimeoutError):
         call_with_timeout(lambda: (time.sleep(1), b"")[1], timeout_seconds=0.01)
+
+
+def _clear_llm_process_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in (
+        "TW_WATCH_LLM_BACKEND",
+        "TW_WATCH_CODEX_MODEL",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+    ):
+        monkeypatch.delenv(key, raising=False)

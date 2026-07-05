@@ -20,6 +20,7 @@ from tw_watchdesk.setup_env import (
     redact_setup_text,
     run_full_setup,
     validate_setup_inputs,
+    verify_llm_environment,
 )
 
 
@@ -42,6 +43,7 @@ class SetupWizard:
         self.configure_mcp_var = BooleanVar(value=True)
         self.verify_mcp_var = BooleanVar(value=True)
         self.verify_nova_var = BooleanVar(value=True)
+        self.verify_llm_var = BooleanVar(value=True)
         self.register_api_var = BooleanVar(value=True)
 
         self._build_ui()
@@ -105,7 +107,8 @@ class SetupWizard:
         ttk.Checkbutton(checks, text="驗證 Fugle MCP initialize/tools", variable=self.verify_mcp_var).grid(row=1, column=1, sticky="w", pady=2)
         ttk.Checkbutton(checks, text="驗證 Nova login/initRealtime", variable=self.verify_nova_var).grid(row=1, column=2, sticky="w", pady=2)
         ttk.Checkbutton(checks, text="確認/開通 Nova API 權限", variable=self.register_api_var).grid(row=2, column=0, sticky="w", pady=2)
-        ttk.Label(checks, text="MCP 下單固定關閉：ENABLE_ORDER=false", foreground="#555").grid(row=2, column=1, columnspan=2, sticky="w", pady=2)
+        ttk.Checkbutton(checks, text="檢查 LLM / Codex CLI 環境", variable=self.verify_llm_var).grid(row=2, column=1, sticky="w", pady=2)
+        ttk.Label(checks, text="MCP 下單固定關閉：ENABLE_ORDER=false", foreground="#555").grid(row=2, column=2, sticky="w", pady=2)
 
         log_frame = ttk.Frame(options)
         log_frame.grid(row=1, column=0, sticky="nsew")
@@ -155,6 +158,7 @@ class SetupWizard:
             configure_codex_mcp=self.configure_mcp_var.get(),
             verify_mcp=self.verify_mcp_var.get(),
             verify_nova=self.verify_nova_var.get(),
+            verify_llm=self.verify_llm_var.get(),
             register_api_auth=self.register_api_var.get(),
             copy_certificate=self.copy_cert_var.get(),
             enable_order=False,
@@ -220,12 +224,19 @@ class SetupWizard:
 
 def static_self_check() -> int:
     settings = load_settings(app_base_dir())
+    llm_result = verify_llm_environment(app_base_dir())
     payload = {
         "settings_file": str(default_settings_file(app_base_dir())),
         "codex_config": str(default_codex_config_path()),
         "has_nova_user": bool(settings.nova_user),
         "has_cert_path": bool(settings.nova_cert_path),
         "market_data_mode": settings.market_data_mode,
+        "llm_backend": settings.llm_backend,
+        "llm_environment": {
+            "status": llm_result.status,
+            "detail": llm_result.detail,
+            "remediation": llm_result.remediation,
+        },
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
