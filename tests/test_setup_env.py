@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 import time
+import types
 from io import BytesIO
 
 import pytest
@@ -17,6 +19,7 @@ from tw_watchdesk.setup_env import (
     replace_fugle_mcp_block,
     send_mcp_message,
     validate_setup_inputs,
+    verify_nova_login,
     verify_llm_environment,
 )
 
@@ -116,6 +119,53 @@ def test_build_fugle_mcp_env_defaults_orders_disabled() -> None:
     assert env["SDK_TYPE"] == "taishin"
     assert env["ENABLE_ORDER"] == "false"
     assert env["NATIONAL_ID"] == "A123456789"
+
+
+def test_verify_nova_login_supports_snake_case_taishin_sdk(monkeypatch) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class FakeTaishinSDK:
+        def login(self, user: str, password: str, cert_path: str, cert_password: str) -> list[str]:
+            calls.append(("login", user))
+            return ["acct-1"]
+
+        def register_api_auth(self, account: object) -> None:
+            calls.append(("register_api_auth", account))
+
+        def init_realtime(self, account: object) -> None:
+            calls.append(("init_realtime", account))
+
+    monkeypatch.setitem(sys.modules, "taishin_sdk", types.SimpleNamespace(TaishinSDK=FakeTaishinSDK))
+
+    result = verify_nova_login(credentials())
+
+    assert result.status == "ok"
+    assert ("login", "A123456789") in calls
+    assert ("register_api_auth", "acct-1") in calls
+    assert ("init_realtime", "acct-1") in calls
+
+
+def test_verify_nova_login_supports_camel_case_taishin_sdk(monkeypatch) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class FakeTaishinSDK:
+        def login(self, user: str, password: str, cert_path: str, cert_password: str) -> list[str]:
+            calls.append(("login", user))
+            return ["acct-1"]
+
+        def registerApiAuth(self, account: object) -> None:  # noqa: N802 - SDK compatibility shim.
+            calls.append(("registerApiAuth", account))
+
+        def initRealtime(self, account: object) -> None:  # noqa: N802 - SDK compatibility shim.
+            calls.append(("initRealtime", account))
+
+    monkeypatch.setitem(sys.modules, "taishin_sdk", types.SimpleNamespace(TaishinSDK=FakeTaishinSDK))
+
+    result = verify_nova_login(credentials())
+
+    assert result.status == "ok"
+    assert ("registerApiAuth", "acct-1") in calls
+    assert ("initRealtime", "acct-1") in calls
 
 
 def test_verify_llm_environment_accepts_codex_cli_login(tmp_path, monkeypatch) -> None:

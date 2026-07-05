@@ -305,7 +305,7 @@ def verify_nova_login(credentials: SetupCredentials, register_api_auth: bool = T
         auth_note = ""
         if register_api_auth:
             try:
-                sdk.registerApiAuth(account)
+                _sdk_method(sdk, "register_api_auth", "registerApiAuth")(account)
                 auth_note = "；API 權限已送出或確認"
             except Exception as exc:  # noqa: BLE001 - SDK raises provider-specific exceptions.
                 message = str(exc)
@@ -313,10 +313,19 @@ def verify_nova_login(credentials: SetupCredentials, register_api_auth: bool = T
                     auth_note = "；API 權限已存在"
                 else:
                     raise
-        sdk.initRealtime(account)
+        _sdk_method(sdk, "init_realtime", "initRealtime")(account)
     except Exception as exc:  # noqa: BLE001 - SDK raises provider-specific exceptions.
-        return StepResult("Nova 登入", "error", f"Nova login/initRealtime 失敗：{redact_setup_text(str(exc), credentials)}")
-    return StepResult("Nova 登入", "ok", f"登入、帳戶取得與 initRealtime 成功{auth_note}。")
+        return StepResult("Nova 登入", "error", f"Nova login/realtime 初始化失敗：{redact_setup_text(str(exc), credentials)}")
+    return StepResult("Nova 登入", "ok", f"登入、帳戶取得與 realtime 初始化成功{auth_note}。")
+
+
+def _sdk_method(sdk: object, *names: str) -> Callable[[object], object]:
+    for name in names:
+        method = getattr(sdk, name, None)
+        if callable(method):
+            return method
+    joined = " 或 ".join(names)
+    raise AttributeError(f"TaishinSDK object has no supported method: {joined}")
 
 
 def ensure_node_and_npm(npm_path: str | None, install_with_winget: bool) -> tuple[StepResult, str | None]:
