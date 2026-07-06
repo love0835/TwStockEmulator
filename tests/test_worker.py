@@ -6,7 +6,7 @@ from tw_watchdesk.config import Settings
 from tw_watchdesk.models import OrderBookLevel, Quote
 from tw_watchdesk.nova import parse_realtime_market_event
 from tw_watchdesk.storage import DAYTRADE_ACCOUNT, SWING_ACCOUNT, TradingStore
-from tw_watchdesk.worker import TradingLabWorker
+from tw_watchdesk.worker import TradingLabWorker, _proposal_status_label
 
 
 class FakeProvider:
@@ -879,8 +879,14 @@ def test_worker_can_run_swing_review_immediately(tmp_path) -> None:
     message = worker.run_swing_review_now()
 
     assert "短線會後討論完成" in message
+    assert "version_created" not in message
     assert adapter.calls == 1
     assert store.get_active_strategy_version("swing").version == "swing-v2"
+
+
+def test_worker_review_status_label_hides_internal_review_only_code() -> None:
+    assert _proposal_status_label("review_only") == "已討論，不需改版"
+    assert _proposal_status_label("version_reused_applied") == "沿用既有新版並套用"
 
 
 def test_worker_swing_review_immediate_uses_recent_window(tmp_path) -> None:

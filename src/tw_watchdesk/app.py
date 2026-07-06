@@ -1207,13 +1207,38 @@ def _proposal_status_label(value: object) -> str:
         "insufficient_data": "資料不足",
         "llm_error": "LLM 失敗",
         "validation_failed": "驗證失敗",
-        "no_change": "不改版",
-        "review_only": "只記錄檢討",
+        "no_change": "已討論，不需改版",
+        "review_only": "已討論，不需改版",
         "risk_rejected": "風控拒絕",
         "pending_version_created": "已建立新版",
+        "pending_version_reused": "沿用既有新版",
         "version_created_applied": "已建立並套用",
         "version_created_locked": "已建立未套用",
+        "version_reused_applied": "沿用既有新版並套用",
+        "version_reused_locked": "沿用既有新版但目前鎖定",
     }.get(str(value), str(value))
+
+
+def _agent_action_label(value: object) -> str:
+    return {
+        "propose_change": "建議建立新版",
+        "record_review_only": "已討論，不需改版",
+        "reject": "拒絕",
+        "insufficient_evidence": "證據不足",
+        "needs_human_review": "需要人工確認",
+    }.get(str(value), str(value))
+
+
+def _agent_review_status_label(value: object) -> str:
+    return {
+        "ok": "成功",
+        "error": "失敗",
+        "pass": "通過",
+        "reject": "拒絕",
+        "needs_human_review": "需要人工確認",
+        "sufficient": "足夠",
+        "insufficient": "不足",
+    }.get(str(value), _proposal_status_label(value))
 
 
 def _format_latest_strategy_review(row: object, timezone_name: str) -> str:
@@ -1291,8 +1316,8 @@ def _format_agent_reviews(rows: list[object], timezone_name: str) -> str:
             "\n".join(
                 [
                     f"- {_format_db_time(row['created_at'], timezone_name)} {row['agent_name']}",
-                    f"  狀態：{row['status']}；動作：{row['action'] or '-'}；信心：{row['confidence'] if row['confidence'] is not None else '-'}",
-                    f"  evidence_quality：{row['evidence_quality'] or '-'}",
+                    f"  狀態：{_agent_review_status_label(row['status'])}；動作：{_agent_action_label(row['action']) if row['action'] else '-'}；信心：{row['confidence'] if row['confidence'] is not None else '-'}",
+                    f"  evidence_quality：{_agent_review_status_label(row['evidence_quality']) if row['evidence_quality'] else '-'}",
                     f"  output_hash：{row['output_hash'] or '-'}",
                     f"  摘要/JSON：{output}",
                 ]
@@ -1331,7 +1356,7 @@ def _format_news_contexts(rows: list[object]) -> str:
             "\n".join(
                 [
                     f"- {row['symbol']}：{row['summary'] or '-'}",
-                    f"  狀態：{row['status']}",
+                    f"  狀態：{_agent_review_status_label(row['status'])}",
                     f"  sources：{_format_json_text(row['source_urls_json'])}",
                     f"  context：{_format_json_text(row['context_json'])}",
                 ]
@@ -1355,9 +1380,29 @@ def _format_json_text(value: object) -> str:
     if not text:
         return "-"
     try:
-        return json.dumps(json.loads(text), ensure_ascii=False, indent=2)
+        return json.dumps(_localize_json_for_display(json.loads(text)), ensure_ascii=False, indent=2)
     except json.JSONDecodeError:
-        return text
+        return _display_value_label(text)
+
+
+def _localize_json_for_display(value: object) -> object:
+    if isinstance(value, dict):
+        return {key: _localize_json_for_display(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_localize_json_for_display(item) for item in value]
+    if isinstance(value, str):
+        return _display_value_label(value)
+    return value
+
+
+def _display_value_label(value: str) -> str:
+    label = _agent_action_label(value)
+    if label != value:
+        return label
+    label = _proposal_status_label(value)
+    if label != value:
+        return label
+    return _agent_review_status_label(value)
 
 
 def _review_run_id_from_metrics(value: object) -> int | None:

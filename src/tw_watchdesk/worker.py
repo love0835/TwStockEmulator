@@ -245,7 +245,7 @@ class TradingLabWorker:
             for row in self.store.list_daily_reviews(limit=500)
             if str(row["review_date"]) == trade_date and str(row["strategy"]) in {"daytrade", "swing"}
         ]
-        status_text = "、".join(f"{_strategy_label(str(row['strategy']))}:{row['proposal_status']}" for row in reviews) or "已送出"
+        status_text = "、".join(f"{_strategy_label(str(row['strategy']))}:{_proposal_status_label(row['proposal_status'])}" for row in reviews) or "已送出"
         return f"{trade_date} 完整會後討論完成：{status_text}"
 
     def run_swing_review_now(self, trade_date: str | None = None) -> str:
@@ -299,7 +299,7 @@ class TradingLabWorker:
         if not rows:
             return f"{trade_date} 短線會後討論已執行"
         row = rows[0]
-        return f"{trade_date} 短線會後討論完成：{row['proposal_status']}；版本 {row['strategy_version'] or active.version}"
+        return f"{trade_date} 短線會後討論完成：{_proposal_status_label(row['proposal_status'])}；版本 {row['strategy_version'] or active.version}"
 
     def run_daytrade_review_now(self, trade_date: str | None = None) -> str:
         now = datetime.now(timezone.utc)
@@ -353,7 +353,7 @@ class TradingLabWorker:
         if not rows:
             return f"{trade_date} 當沖會後討論已執行"
         row = rows[0]
-        return f"{trade_date} 當沖會後討論完成：{row['proposal_status']}"
+        return f"{trade_date} 當沖會後討論完成：{_proposal_status_label(row['proposal_status'])}"
 
     def run_multi_agent_review_now(self, trade_date: str | None = None) -> str:
         now = datetime.now(timezone.utc)
@@ -1781,6 +1781,27 @@ def _actor_for_strategy(strategy: str) -> str:
 
 def _strategy_label(strategy: str) -> str:
     return STRATEGY_LABELS.get(strategy, strategy)
+
+
+def _proposal_status_label(value: object) -> str:
+    return {
+        "none": "無",
+        "reviewing": "討論中",
+        "reviewed": "已檢討",
+        "disabled": "未啟用",
+        "insufficient_data": "資料不足",
+        "llm_error": "LLM 失敗",
+        "validation_failed": "驗證失敗",
+        "no_change": "已討論，不需改版",
+        "review_only": "已討論，不需改版",
+        "risk_rejected": "風控拒絕",
+        "pending_version_created": "已建立新版",
+        "pending_version_reused": "沿用既有新版",
+        "version_created_applied": "已建立並套用",
+        "version_created_locked": "已建立未套用",
+        "version_reused_applied": "沿用既有新版並套用",
+        "version_reused_locked": "沿用既有新版但目前鎖定",
+    }.get(str(value), str(value))
 
 
 def _review_window(trade_date: str, days: int = REVIEW_LOOKBACK_DAYS) -> tuple[date, date]:
