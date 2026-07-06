@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from tw_watchdesk.llm import CodexResult
 from tw_watchdesk.config import Settings
 from tw_watchdesk.models import OrderBookLevel, Quote
-from tw_watchdesk.nova import parse_realtime_market_event
+from tw_watchdesk.nova import ProviderUnavailable, parse_realtime_market_event
 from tw_watchdesk.storage import DAYTRADE_ACCOUNT, SWING_ACCOUNT, TradingStore
 from tw_watchdesk.worker import TradingLabWorker, _proposal_status_label
 
@@ -45,6 +45,15 @@ class FakeProvider:
             snapshot = Snapshot()
 
         return StockClient()
+
+
+class FailingProvider(FakeProvider):
+    def __init__(self, quote: Quote, reason: str = "SDK network down") -> None:
+        super().__init__(quote)
+        self.reason = reason
+
+    def subscribe_market_data(self, symbols: list[str], channels: tuple[str, ...]) -> None:
+        raise ProviderUnavailable(self.reason)
 
 
 class FakeLlmAdapter:
@@ -431,6 +440,41 @@ def test_worker_realtime_capture_subscribes_candidates_and_persists_events(tmp_p
     assert store.get_ticks_after("2330", now)[0]["price"] == 99.5
     assert store.latest_order_book("2330")["best_bid"] == 99.5
     assert store.get_bars_after("2330", 1, now - timedelta(minutes=1))
+
+
+def test_worker_provider_unavailable_logs_every_five_minutes_before_open(tmp_path) -> None:
+    store = TradingStore(tmp_path / "lab.sqlite3")
+    store.initialize()
+    first = datetime(2026, 7, 2, 0, 30, tzinfo=timezone.utc)
+    provider = FailingProvider(_quote(first))
+    worker = TradingLabWorker(settings=Settings(enable_auto_scout=False), store=store, provider=provider)
+    store.upsert_candidate(trade_date="2026-07-02", strategy="daytrade", symbol="2330", name="台積電")
+
+    worker.run_tick(first)
+    worker.run_tick(first + timedelta(minutes=4))
+    worker.run_tick(first + timedelta(minutes=5))
+
+    events = [row for row in store.list_monitor_events(trade_date="2026-07-02", actor="market_data") if row["event_type"] == "provider_unavailable"]
+    assert len(events) == 2
+    assert {row["severity"] for row in events} == {"warning"}
+    assert json.loads(events[0]["metrics_json"])["retry_interval_seconds"] == 5 * 60
+
+
+def test_worker_provider_unavailable_logs_hourly_off_hours(tmp_path) -> None:
+    store = TradingStore(tmp_path / "lab.sqlite3")
+    store.initialize()
+    first = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+    provider = FailingProvider(_quote(first))
+    worker = TradingLabWorker(settings=Settings(enable_auto_scout=False), store=store, provider=provider)
+    store.upsert_candidate(trade_date="2026-07-02", strategy="daytrade", symbol="2330", name="台積電")
+
+    worker.run_tick(first)
+    worker.run_tick(first + timedelta(minutes=30))
+
+    events = [row for row in store.list_monitor_events(trade_date="2026-07-02", actor="market_data") if row["event_type"] == "provider_unavailable"]
+    assert len(events) == 1
+    assert events[0]["severity"] == "info"
+    assert json.loads(events[0]["metrics_json"])["retry_interval_seconds"] == 60 * 60
 
 
 def test_worker_realtime_capture_drain_flushes_queued_events_after_stop(tmp_path) -> None:

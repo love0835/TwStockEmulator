@@ -4,8 +4,9 @@ import json
 import threading
 import time
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, time as day_time, timedelta, timezone
 from typing import Any, Callable, Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tw_watchdesk.config import Settings
 from tw_watchdesk.models import OrderBookLevel, Quote, RealtimeMarketEvent
@@ -34,6 +35,10 @@ class ProviderUnavailable(RuntimeError):
 
 
 MARKET_DATA_CHANNELS = {"trades", "books", "aggregates", "candles", "indices"}
+NOVA_ACTIVE_RETRY_SECONDS = 5 * 60
+NOVA_OFF_HOURS_RETRY_SECONDS = 60 * 60
+NOVA_ACTIVE_RETRY_START = day_time(8, 0)
+NOVA_ACTIVE_RETRY_END = day_time(13, 35)
 
 
 def parse_aggregates_message(message: str | Mapping[str, Any], received_at: datetime | None = None) -> Quote:
@@ -153,6 +158,8 @@ class TaishinNovaProvider:
         self._stock: Any = None
         self._listeners: list[Callable[[RealtimeMarketEvent], None]] = []
         self._channel_subscriptions: set[tuple[str, str]] = set()
+        self._last_connect_attempt_at: datetime | None = None
+        self._last_connect_failure = ""
 
     def get_quote(self, symbol: str) -> Quote:
         symbol = symbol.upper().strip()
@@ -170,35 +177,68 @@ class TaishinNovaProvider:
         with self._connect_lock:
             if self._connected:
                 return
-            self._ensure_marketdata()
-            self._stock = _marketdata_stock_client(self._sdk)
+            now = datetime.now(timezone.utc)
+            self._guard_connect_retry(now)
+            try:
+                self._ensure_marketdata(now)
+            except ProviderUnavailable:
+                raise
+            try:
+                self._stock = _marketdata_stock_client(self._sdk)
+            except ProviderUnavailable as exc:
+                self._last_connect_attempt_at = now
+                self._record_connect_failure(exc)
+                raise
+            except Exception as exc:
+                failure = ProviderUnavailable(f"Nova 即時行情初始化失敗：{exc}")
+                self._last_connect_attempt_at = now
+                self._record_connect_failure(failure)
+                raise failure from exc
+            self._last_connect_attempt_at = now
             try:
                 self._stock.on("message", self._handle_message)
                 self._stock.connect()
             except Exception as exc:
-                raise ProviderUnavailable(f"Nova 即時行情連線失敗：{exc}") from exc
+                failure = ProviderUnavailable(f"Nova 即時行情連線失敗：{exc}")
+                self._record_connect_failure(failure)
+                raise failure from exc
             self._connected = True
+            self._last_connect_failure = ""
 
-    def _ensure_marketdata(self) -> None:
+    def _ensure_marketdata(self, now: datetime | None = None) -> None:
         with self._connect_lock:
             if self._marketdata_ready:
                 return
+            now = now or datetime.now(timezone.utc)
+            self._guard_connect_retry(now)
+            self._last_connect_attempt_at = now
             try:
                 from taishin_sdk import TaishinSDK  # type: ignore
             except ImportError as exc:
-                raise ProviderUnavailable("缺少 taishin_sdk，無法使用 Nova live mode") from exc
-            self._sdk = TaishinSDK()
-            accounts = self._sdk.login(
-                self.settings.nova_user,
-                self.settings.nova_password,
-                self.settings.nova_cert_path,
-                self.settings.nova_cert_password,
-            )
-            account = accounts[0] if accounts else None
-            if account is None:
-                raise ProviderUnavailable("Nova 登入成功但沒有可用帳戶")
-            self._sdk.init_realtime(account)
+                failure = ProviderUnavailable("缺少 taishin_sdk，無法使用 Nova live mode")
+                self._record_connect_failure(failure)
+                raise failure from exc
+            try:
+                self._sdk = TaishinSDK()
+                accounts = self._sdk.login(
+                    self.settings.nova_user,
+                    self.settings.nova_password,
+                    self.settings.nova_cert_path,
+                    self.settings.nova_cert_password,
+                )
+                account = accounts[0] if accounts else None
+                if account is None:
+                    raise ProviderUnavailable("Nova 登入成功但沒有可用帳戶")
+                self._sdk.init_realtime(account)
+            except ProviderUnavailable as exc:
+                self._record_connect_failure(exc)
+                raise
+            except Exception as exc:
+                failure = ProviderUnavailable(f"Nova SDK 登入/初始化失敗：{exc}")
+                self._record_connect_failure(failure)
+                raise failure from exc
             self._marketdata_ready = True
+            self._last_connect_failure = ""
 
     def get_stock_rest_client(self) -> Any:
         self._ensure_marketdata()
@@ -258,6 +298,21 @@ class TaishinNovaProvider:
         with self._lock:
             self._quotes[quote.symbol] = quote
 
+    def _guard_connect_retry(self, now: datetime) -> None:
+        if self._last_connect_attempt_at is None or not self._last_connect_failure:
+            return
+        interval_seconds = _nova_retry_interval_seconds(now, self.settings.timezone)
+        elapsed_seconds = (now - self._last_connect_attempt_at).total_seconds()
+        if elapsed_seconds >= interval_seconds:
+            return
+        next_retry = self._last_connect_attempt_at + timedelta(seconds=interval_seconds)
+        raise ProviderUnavailable(
+            f"{self._last_connect_failure}；等待下次 Nova 重試（{_format_local_time(next_retry, self.settings.timezone)}）"
+        )
+
+    def _record_connect_failure(self, exc: ProviderUnavailable) -> None:
+        self._last_connect_failure = str(exc)
+
 
 class UnavailableProvider:
     def __init__(self, reason: str) -> None:
@@ -269,6 +324,12 @@ class UnavailableProvider:
     def get_stock_rest_client(self) -> Any:
         raise ProviderUnavailable(self.reason)
 
+    def add_market_data_listener(self, listener: Callable[[RealtimeMarketEvent], None]) -> None:
+        raise ProviderUnavailable(self.reason)
+
+    def subscribe_market_data(self, symbols: list[str], channels: tuple[str, ...]) -> None:
+        raise ProviderUnavailable(self.reason)
+
 
 def create_provider(settings: Settings) -> QuoteProvider:
     if settings.market_data_mode != "live":
@@ -277,6 +338,29 @@ def create_provider(settings: Settings) -> QuoteProvider:
         return TaishinNovaProvider(settings)
     except ProviderUnavailable as exc:
         return UnavailableProvider(str(exc))
+
+
+def _nova_retry_interval_seconds(now: datetime, timezone_name: str) -> int:
+    local = _local_datetime(now, timezone_name)
+    return NOVA_ACTIVE_RETRY_SECONDS if _is_nova_active_retry_window(local) else NOVA_OFF_HOURS_RETRY_SECONDS
+
+
+def _is_nova_active_retry_window(local: datetime) -> bool:
+    return local.weekday() < 5 and NOVA_ACTIVE_RETRY_START <= local.time() <= NOVA_ACTIVE_RETRY_END
+
+
+def _local_datetime(value: datetime, timezone_name: str) -> datetime:
+    try:
+        tz = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        tz = timezone.utc
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(tz)
+
+
+def _format_local_time(value: datetime, timezone_name: str) -> str:
+    return _local_datetime(value, timezone_name).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _marketdata_stock_client(sdk: Any) -> Any:

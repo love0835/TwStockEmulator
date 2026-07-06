@@ -92,6 +92,7 @@ class TradingLabWorker:
         self._realtime_capture_queue: queue.Queue[RealtimeMarketEvent] = queue.Queue(maxsize=50_000)
         self._realtime_capture_thread: threading.Thread | None = None
         self._realtime_capture_dropped = 0
+        self._provider_unavailable_last_log_at: datetime | None = None
         self._status_lock = threading.RLock()
         self._status = WorkerStatus(
             running=False,
@@ -409,7 +410,11 @@ class TradingLabWorker:
                 self._realtime_capture_unavailable_logged = True
             return
         if not self._realtime_capture_listener_registered:
-            add_listener(self._handle_realtime_market_event)
+            try:
+                add_listener(self._handle_realtime_market_event)
+            except ProviderUnavailable as exc:
+                self._handle_provider_unavailable(exc, now, source="盤中行情 listener 註冊")
+                return
             self._realtime_capture_listener_registered = True
         symbols = self._realtime_capture_target_symbols(now)
         new_symbols = [symbol for symbol in symbols if symbol not in self._realtime_capture_symbols]
@@ -421,15 +426,10 @@ class TradingLabWorker:
         try:
             subscribe(new_symbols, channels)
         except ProviderUnavailable as exc:
-            self._log_event(
-                "market_data",
-                "realtime_capture",
-                "realtime_capture_subscribe_failed",
-                "盤中行情訂閱失敗",
-                detail=str(exc),
-                severity="warning",
-                created_at=now,
-                trade_date=now.astimezone(ZoneInfo(self.settings.timezone)).date().isoformat(),
+            self._handle_provider_unavailable(
+                exc,
+                now,
+                source="盤中行情訂閱",
                 metrics={"symbols": new_symbols, "channels": channels},
             )
             return
@@ -578,6 +578,8 @@ class TradingLabWorker:
         while not self.stop_event.is_set():
             try:
                 self.run_tick()
+            except ProviderUnavailable as exc:
+                self._handle_provider_unavailable(exc, datetime.now(timezone.utc), source="交易實驗室排程")
             except Exception as exc:
                 message = f"{exc.__class__.__name__}: {exc}"
                 self._set_status("system", "error", message, running=True)
@@ -585,6 +587,46 @@ class TradingLabWorker:
                 self._log_event("system", "error", "unhandled_error", "交易實驗室例外", detail=message, severity="error")
             self.stop_event.wait(15)
         self._set_status("system", "stopped", "交易實驗室已停止", running=False)
+
+    def _handle_provider_unavailable(
+        self,
+        exc: ProviderUnavailable,
+        now: datetime,
+        *,
+        source: str,
+        metrics: dict[str, object] | None = None,
+    ) -> None:
+        local = now.astimezone(ZoneInfo(self.settings.timezone))
+        retry_interval_seconds = _provider_unavailable_log_interval_seconds(local)
+        if (
+            self._provider_unavailable_last_log_at is not None
+            and (now - self._provider_unavailable_last_log_at).total_seconds() < retry_interval_seconds
+        ):
+            return
+        self._provider_unavailable_last_log_at = now
+        active_retry_window = _is_provider_active_retry_window(local)
+        severity = "warning" if active_retry_window else "info"
+        detail = (
+            f"{source}：{exc}；"
+            "台股開盤前一小時到盤中每 5 分鐘重試，離峰時段只低頻記錄，不中斷主程式。"
+        )
+        merged_metrics = {
+            "retry_interval_seconds": retry_interval_seconds,
+            "active_retry_window": active_retry_window,
+            **(metrics or {}),
+        }
+        self._set_status("market_data", "api_unavailable", "Nova API 連線不可用，等待下一次重試", now=now)
+        self._log_event(
+            "market_data",
+            "api_unavailable",
+            "provider_unavailable",
+            "Nova API 連線不可用",
+            detail=detail,
+            severity=severity,
+            created_at=now,
+            trade_date=local.date().isoformat(),
+            metrics=merged_metrics,
+        )
 
     def _run_scout(self, trade_date: str, now: datetime, *, manual: bool) -> None:
         active_scout = self.store.get_active_strategy_version("scout")
@@ -1920,6 +1962,14 @@ def _auto_scout_time(value: str) -> time:
         return time(hour, minute)
     except (AttributeError, TypeError, ValueError):
         return time(9, 5)
+
+
+def _provider_unavailable_log_interval_seconds(local: datetime) -> int:
+    return 5 * 60 if _is_provider_active_retry_window(local) else 60 * 60
+
+
+def _is_provider_active_retry_window(local: datetime) -> bool:
+    return local.weekday() < 5 and time(8, 0) <= local.time() <= time(13, 35)
 
 
 def _next_ticks(now: datetime, timezone_name: str) -> tuple[datetime, datetime]:

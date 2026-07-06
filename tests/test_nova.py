@@ -1,6 +1,19 @@
+import sys
+import types
 from datetime import datetime, timezone
 
-from tw_watchdesk.nova import _marketdata_rest_stock_client, _marketdata_stock_client, parse_aggregates_message, parse_realtime_market_event
+import pytest
+
+from tw_watchdesk.config import Settings
+from tw_watchdesk.nova import (
+    ProviderUnavailable,
+    TaishinNovaProvider,
+    _marketdata_rest_stock_client,
+    _marketdata_stock_client,
+    _nova_retry_interval_seconds,
+    parse_aggregates_message,
+    parse_realtime_market_event,
+)
 
 
 def test_parse_aggregates_message() -> None:
@@ -123,3 +136,44 @@ def test_marketdata_rest_stock_client() -> None:
         marketdata = MarketData()
 
     assert _marketdata_rest_stock_client(Sdk()) is MarketData.rest_client.stock
+
+
+def test_nova_retry_interval_is_five_minutes_before_open() -> None:
+    now = datetime(2026, 7, 2, 0, 30, tzinfo=timezone.utc)
+
+    assert _nova_retry_interval_seconds(now, "Asia/Taipei") == 5 * 60
+
+
+def test_nova_retry_interval_is_hourly_off_hours() -> None:
+    now = datetime(2026, 7, 2, 12, 0, tzinfo=timezone.utc)
+
+    assert _nova_retry_interval_seconds(now, "Asia/Taipei") == 60 * 60
+
+
+def test_nova_provider_throttles_failed_sdk_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FailingSdk:
+        calls = 0
+
+        def __init__(self) -> None:
+            FailingSdk.calls += 1
+
+        def login(self, *args):
+            raise RuntimeError("network down")
+
+    module = types.ModuleType("taishin_sdk")
+    module.TaishinSDK = FailingSdk
+    monkeypatch.setitem(sys.modules, "taishin_sdk", module)
+    settings = Settings(
+        nova_user="user",
+        nova_password="password",
+        nova_cert_path="cert.pfx",
+        nova_cert_password="cert-password",
+    )
+    provider = TaishinNovaProvider(settings)
+
+    with pytest.raises(ProviderUnavailable, match="Nova SDK"):
+        provider.get_stock_rest_client()
+    with pytest.raises(ProviderUnavailable, match="等待下次 Nova 重試"):
+        provider.get_stock_rest_client()
+
+    assert FailingSdk.calls == 1
