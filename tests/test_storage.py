@@ -324,6 +324,78 @@ def test_sell_from_unattributed_position_does_not_backfill_active_strategy(tmp_p
     assert sell_order.attribution_status == "partial_missing_strategy_version_candidate_entry_order"
 
 
+def test_initialize_backfills_legacy_daytrade_attribution(tmp_path) -> None:
+    store = TradingStore(tmp_path / "lab.sqlite3")
+    store.initialize()
+    at = datetime(2026, 7, 3, 1, 10, tzinfo=timezone.utc)
+    candidate_id = store.upsert_candidate(
+        trade_date="2026-07-03",
+        strategy="daytrade",
+        symbol="2330",
+        name="台積電",
+        score=88,
+        reason="legacy scout",
+        source="auto_scout",
+        created_at=at,
+    )
+    conn = store._conn
+    buy_id = conn.execute(
+        """
+        INSERT INTO orders(
+            account_id, strategy, symbol, side, price, qty, status, reason,
+            reserved_cash, candidate_id, created_at, expires_at, raw_decision
+        )
+        VALUES (?, 'daytrade', '2330', 'buy', 100, 1000, 'filled', 'legacy buy',
+                0, ?, ?, ?, '{}')
+        """,
+        (DAYTRADE_ACCOUNT, candidate_id, at.isoformat(), (at + timedelta(minutes=5)).isoformat()),
+    ).lastrowid
+    sell_at = at + timedelta(minutes=5)
+    sell_id = conn.execute(
+        """
+        INSERT INTO orders(
+            account_id, strategy, symbol, side, price, qty, status, reason,
+            reserved_cash, created_at, expires_at, raw_decision
+        )
+        VALUES (?, 'daytrade', '2330', 'sell', 99, 1000, 'filled', 'legacy sell',
+                0, ?, ?, '{}')
+        """,
+        (DAYTRADE_ACCOUNT, sell_at.isoformat(), (sell_at + timedelta(minutes=5)).isoformat()),
+    ).lastrowid
+    conn.execute(
+        """
+        INSERT INTO fills(
+            order_id, account_id, strategy, symbol, side, price, qty, gross_amount,
+            fee, tax, net_cash_delta, realized_pnl, filled_at
+        )
+        VALUES (?, ?, 'daytrade', '2330', 'sell', 99, 1000, 99000, 0, 0, 99000, -1000, ?)
+        """,
+        (sell_id, DAYTRADE_ACCOUNT, (sell_at + timedelta(seconds=1)).isoformat()),
+    )
+    conn.commit()
+
+    store.initialize()
+
+    candidate = store.list_candidates("2026-07-03", "daytrade")[0]
+    assert candidate.scout_version == "scout-v1"
+    orders = {row["id"]: row for row in store.list_orders(limit=10)}
+    assert orders[buy_id]["strategy_version"] == "daytrade-v1"
+    assert orders[buy_id]["scout_version"] == "scout-v1"
+    assert orders[buy_id]["entry_order_id"] == buy_id
+    assert orders[buy_id]["attribution_status"] == "complete"
+    assert orders[sell_id]["strategy_version"] == "daytrade-v1"
+    assert orders[sell_id]["candidate_id"] == candidate_id
+    assert orders[sell_id]["entry_order_id"] == buy_id
+    assert orders[sell_id]["scout_version"] == "scout-v1"
+    assert orders[sell_id]["attribution_status"] == "complete"
+    fill = store.list_fills(limit=1)[0]
+    assert fill["strategy_version"] == "daytrade-v1"
+    assert fill["candidate_id"] == candidate_id
+    assert fill["entry_order_id"] == buy_id
+    assert fill["scout_version"] == "scout-v1"
+    assert fill["attribution_status"] == "complete"
+
+
 def test_monitor_events_filter_and_persist(tmp_path) -> None:
     db_path = tmp_path / "lab.sqlite3"
     store = TradingStore(db_path)

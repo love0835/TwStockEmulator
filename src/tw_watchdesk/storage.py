@@ -545,6 +545,7 @@ class TradingStore:
             self._conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_order_books_event_key ON order_books(event_key) WHERE event_key <> ''")
             self._seed_accounts()
             self._seed_strategy_versions()
+            self._backfill_legacy_attribution()
             self._conn.commit()
 
     def _ensure_order_schema(self) -> None:
@@ -738,6 +739,254 @@ class TradingStore:
                 """,
                 (strategy, version, FOLLOW_LATEST, now),
             )
+
+    def _backfill_legacy_attribution(self) -> None:
+        self._conn.execute(
+            """
+            UPDATE candidates
+            SET scout_version = ?
+            WHERE source = 'auto_scout' AND scout_version = ''
+            """,
+            (f"{SCOUT_STRATEGY}-v1",),
+        )
+        self._backfill_buy_orders()
+        self._backfill_sell_orders()
+        self._backfill_fills()
+        self._backfill_positions()
+
+    def _backfill_buy_orders(self) -> None:
+        rows = self._conn.execute(
+            """
+            SELECT o.*, c.score AS linked_candidate_score, c.source AS linked_candidate_source,
+                   c.reason AS linked_candidate_reason, c.scout_version AS linked_scout_version
+            FROM orders o
+            LEFT JOIN candidates c ON c.id = o.candidate_id
+            WHERE o.side = 'buy'
+              AND (
+                  o.attribution_status = 'legacy_unverified'
+                  OR o.strategy_version = ''
+                  OR o.scout_version = ''
+                  OR o.entry_order_id IS NULL
+              )
+            ORDER BY o.created_at, o.id
+            """
+        ).fetchall()
+        for row in rows:
+            strategy_version = _row_text(row, "strategy_version") or _default_version(_row_text(row, "strategy"))
+            candidate_source = _row_text(row, "candidate_source") or _row_text(row, "linked_candidate_source")
+            scout_version = _row_text(row, "scout_version") or _row_text(row, "linked_scout_version")
+            if candidate_source == "auto_scout" and not scout_version:
+                scout_version = f"{SCOUT_STRATEGY}-v1"
+            entry_order_id = _row_int(row, "entry_order_id") or int(row["id"])
+            candidate_id = _row_int(row, "candidate_id")
+            status = _order_attribution_status(
+                side="buy",
+                strategy_version=strategy_version,
+                candidate_id=candidate_id,
+                entry_order_id=entry_order_id,
+                candidate_source=candidate_source,
+                scout_version=scout_version,
+            )
+            self._conn.execute(
+                """
+                UPDATE orders
+                SET strategy_version = ?,
+                    entry_order_id = ?,
+                    scout_version = ?,
+                    candidate_score = COALESCE(candidate_score, ?),
+                    candidate_source = COALESCE(NULLIF(candidate_source, ''), ?),
+                    candidate_reason = COALESCE(NULLIF(candidate_reason, ''), ?),
+                    attribution_status = ?
+                WHERE id = ?
+                """,
+                (
+                    strategy_version,
+                    entry_order_id,
+                    scout_version,
+                    _optional_float(row["linked_candidate_score"]),
+                    candidate_source,
+                    _row_text(row, "linked_candidate_reason"),
+                    status,
+                    int(row["id"]),
+                ),
+            )
+
+    def _backfill_sell_orders(self) -> None:
+        rows = self._conn.execute(
+            """
+            SELECT *
+            FROM orders
+            WHERE side = 'sell'
+              AND (
+                  attribution_status = 'legacy_unverified'
+                  OR strategy_version = ''
+                  OR candidate_id IS NULL
+                  OR entry_order_id IS NULL
+                  OR scout_version = ''
+              )
+            ORDER BY created_at, id
+            """
+        ).fetchall()
+        for row in rows:
+            entry = self._find_backfill_entry_order(row)
+            strategy_version = _row_text(row, "strategy_version") or _row_text(entry, "strategy_version") or _default_version(_row_text(row, "strategy"))
+            candidate_id = _row_int(row, "candidate_id") or _row_int(entry, "candidate_id")
+            entry_order_id = _row_int(row, "entry_order_id") or _row_int(entry, "entry_order_id") or (_row_int(entry, "id") if entry is not None else None)
+            scout_version = _row_text(row, "scout_version") or _row_text(entry, "scout_version")
+            candidate_source = _row_text(row, "candidate_source") or _row_text(entry, "candidate_source")
+            candidate_reason = _row_text(row, "candidate_reason") or _row_text(entry, "candidate_reason")
+            candidate_score = _optional_float(row["candidate_score"]) if row["candidate_score"] is not None else _optional_float(entry["candidate_score"] if entry is not None else None)
+            if candidate_source == "auto_scout" and not scout_version:
+                scout_version = f"{SCOUT_STRATEGY}-v1"
+            status = _order_attribution_status(
+                side="sell",
+                strategy_version=strategy_version,
+                candidate_id=candidate_id,
+                entry_order_id=entry_order_id,
+                candidate_source=candidate_source,
+                scout_version=scout_version,
+            )
+            self._conn.execute(
+                """
+                UPDATE orders
+                SET strategy_version = ?,
+                    candidate_id = ?,
+                    entry_order_id = ?,
+                    scout_version = ?,
+                    candidate_score = COALESCE(candidate_score, ?),
+                    candidate_source = COALESCE(NULLIF(candidate_source, ''), ?),
+                    candidate_reason = COALESCE(NULLIF(candidate_reason, ''), ?),
+                    attribution_status = ?
+                WHERE id = ?
+                """,
+                (
+                    strategy_version,
+                    candidate_id,
+                    entry_order_id,
+                    scout_version,
+                    candidate_score,
+                    candidate_source,
+                    candidate_reason,
+                    status,
+                    int(row["id"]),
+                ),
+            )
+
+    def _backfill_fills(self) -> None:
+        rows = self._conn.execute(
+            """
+            SELECT f.*, o.strategy_version AS order_strategy_version, o.candidate_id AS order_candidate_id,
+                   o.entry_order_id AS order_entry_order_id, o.scout_version AS order_scout_version,
+                   o.candidate_source AS order_candidate_source
+            FROM fills f
+            LEFT JOIN orders o ON o.id = f.order_id
+            WHERE f.attribution_status = 'legacy_unverified'
+               OR f.strategy_version = ''
+               OR f.candidate_id IS NULL
+               OR f.entry_order_id IS NULL
+               OR f.scout_version = ''
+            ORDER BY f.filled_at, f.id
+            """
+        ).fetchall()
+        for row in rows:
+            strategy = _row_text(row, "strategy")
+            side = _row_text(row, "side")
+            strategy_version = _row_text(row, "strategy_version") or _row_text(row, "order_strategy_version") or _default_version(strategy)
+            candidate_id = _row_int(row, "candidate_id") or _row_int(row, "order_candidate_id")
+            entry_order_id = _row_int(row, "entry_order_id") or _row_int(row, "order_entry_order_id")
+            if side == "buy" and entry_order_id is None:
+                entry_order_id = _row_int(row, "order_id")
+            scout_version = _row_text(row, "scout_version") or _row_text(row, "order_scout_version")
+            candidate_source = _row_text(row, "order_candidate_source")
+            if candidate_source == "auto_scout" and not scout_version:
+                scout_version = f"{SCOUT_STRATEGY}-v1"
+            status = _order_attribution_status(
+                side=side,
+                strategy_version=strategy_version,
+                candidate_id=candidate_id,
+                entry_order_id=entry_order_id,
+                candidate_source=candidate_source,
+                scout_version=scout_version,
+            )
+            self._conn.execute(
+                """
+                UPDATE fills
+                SET strategy_version = ?,
+                    candidate_id = ?,
+                    entry_order_id = ?,
+                    scout_version = ?,
+                    attribution_status = ?
+                WHERE id = ?
+                """,
+                (strategy_version, candidate_id, entry_order_id, scout_version, status, int(row["id"])),
+            )
+
+    def _backfill_positions(self) -> None:
+        rows = self._conn.execute(
+            """
+            SELECT *
+            FROM positions
+            WHERE attribution_status = 'legacy_unverified'
+               OR strategy_version = ''
+               OR candidate_id IS NULL
+               OR entry_order_id IS NULL
+               OR scout_version = ''
+            ORDER BY updated_at, symbol
+            """
+        ).fetchall()
+        for row in rows:
+            entry = self._find_backfill_entry_order(row)
+            strategy_version = _row_text(row, "strategy_version") or _row_text(entry, "strategy_version") or _default_version(_row_text(row, "strategy"))
+            candidate_id = _row_int(row, "candidate_id") or _row_int(entry, "candidate_id")
+            entry_order_id = _row_int(row, "entry_order_id") or _row_int(entry, "entry_order_id") or (_row_int(entry, "id") if entry is not None else None)
+            scout_version = _row_text(row, "scout_version") or _row_text(entry, "scout_version")
+            status = _position_attribution_status(
+                strategy_version=strategy_version,
+                candidate_id=candidate_id,
+                entry_order_id=entry_order_id,
+            )
+            self._conn.execute(
+                """
+                UPDATE positions
+                SET strategy_version = ?,
+                    candidate_id = ?,
+                    entry_order_id = ?,
+                    scout_version = ?,
+                    attribution_status = ?
+                WHERE account_id = ? AND symbol = ?
+                """,
+                (
+                    strategy_version,
+                    candidate_id,
+                    entry_order_id,
+                    scout_version,
+                    status,
+                    row["account_id"],
+                    row["symbol"],
+                ),
+            )
+
+    def _find_backfill_entry_order(self, row: sqlite3.Row) -> sqlite3.Row | None:
+        return self._conn.execute(
+            """
+            SELECT *
+            FROM orders
+            WHERE account_id = ?
+              AND strategy = ?
+              AND symbol = ?
+              AND side = 'buy'
+              AND status = 'filled'
+              AND created_at <= ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (
+                row["account_id"],
+                row["strategy"],
+                row["symbol"],
+                _row_text(row, "created_at") or _row_text(row, "updated_at"),
+            ),
+        ).fetchone()
 
     def get_account(self, account_id: str) -> Account:
         with self._lock:
@@ -2762,23 +3011,27 @@ def _strategy_version_state(row: sqlite3.Row) -> StrategyVersionState:
 
 
 def _optional_float(value: Any) -> float | None:
-    return None if value is None else float(value)
+    return None if value is None or value == "" else float(value)
 
 
-def _row_int(row: sqlite3.Row, key: str) -> int | None:
-    if key not in row.keys() or row[key] is None:
+def _row_int(row: sqlite3.Row | None, key: str) -> int | None:
+    if row is None or key not in row.keys() or row[key] is None:
         return None
     return int(row[key])
 
 
-def _row_float(row: sqlite3.Row, key: str) -> float | None:
-    if key not in row.keys() or row[key] is None:
+def _row_float(row: sqlite3.Row | None, key: str) -> float | None:
+    if row is None or key not in row.keys() or row[key] is None:
         return None
     return float(row[key])
 
 
-def _row_text(row: sqlite3.Row, key: str) -> str:
-    return str(row[key]) if key in row.keys() and row[key] is not None else ""
+def _row_text(row: sqlite3.Row | None, key: str) -> str:
+    return str(row[key]) if row is not None and key in row.keys() and row[key] is not None else ""
+
+
+def _default_version(strategy: str) -> str:
+    return f"{strategy}-v1" if strategy else ""
 
 
 def _buy_order_reserve(price: float, qty: int) -> float:

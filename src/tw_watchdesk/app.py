@@ -316,8 +316,8 @@ class WatchDeskApp:
         self.order_tree = self._make_tree_tab(
             notebook,
             "委託",
-            ("strategy", "symbol", "side", "price", "qty", "status", "version", "candidate", "entry", "scout", "attr", "reason"),
-            ("策略", "股票", "買賣", "價格", "股數", "狀態", "版本", "候選", "進場單", "Scout", "歸因", "理由"),
+            ("time", "strategy", "symbol", "side", "price", "qty", "status", "version", "candidate", "entry", "scout", "attr", "reason"),
+            ("時間", "策略", "股票", "買賣", "價格", "股數", "狀態", "版本", "候選", "進場單", "Scout", "歸因", "理由"),
         )
         self.fill_tree = self._make_tree_tab(
             notebook,
@@ -865,6 +865,7 @@ class WatchDeskApp:
             self.order_tree,
             [
                 (
+                    _format_db_time(row["created_at"], self.settings.timezone),
                     _strategy_label(row["strategy"]),
                     _stock_label(row["symbol"], row["stock_name"]),
                     row["side"],
@@ -885,7 +886,7 @@ class WatchDeskApp:
             self.fill_tree,
             [
                 (
-                    row["filled_at"],
+                    _format_db_time(row["filled_at"], self.settings.timezone),
                     _strategy_label(row["strategy"]),
                     _stock_label(row["symbol"], row["stock_name"]),
                     row["side"],

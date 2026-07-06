@@ -1,6 +1,6 @@
 import json
 
-from tw_watchdesk.app import _display_text, _format_agent_reviews, _format_json_text, _proposal_status_label
+from tw_watchdesk.app import _display_text, _format_agent_reviews, _format_db_time, _format_json_text, _proposal_status_label
 
 
 def test_review_status_labels_hide_internal_review_only_code() -> None:
@@ -32,6 +32,10 @@ def test_display_text_hides_internal_review_status_codes() -> None:
 
     assert "review_only" not in text
     assert text == "2026-07-06 當沖 多 Agent 盤後檢討：已討論，不需改版"
+
+
+def test_db_time_formats_utc_iso_as_local_detail_time() -> None:
+    assert _format_db_time("2026-07-03T01:10:03+00:00", "Asia/Taipei") == "2026-07-03 09:10:03"
 
 
 def test_agent_review_format_hides_internal_action_codes() -> None:
