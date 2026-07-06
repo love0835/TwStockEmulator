@@ -145,6 +145,10 @@ def test_multi_agent_review_creates_pending_versions_without_activation(tmp_path
         payload = json.loads(call["prompt"])
         assert payload["output_language"] == "zh-Hant-TW"
         assert any("Traditional Chinese" in rule for rule in payload["hard_rules"])
+    daytrade_prompt = next(json.loads(call["prompt"]) for call in backend.calls if json.loads(call["prompt"]).get("strategy") == "daytrade")
+    assert any("single trading day" in rule for rule in daytrade_prompt["evaluation_policy"])
+    assert daytrade_prompt["evidence"]["date_distribution"]["orders"]["counts"] == {"2026-07-03": 1}
+    assert daytrade_prompt["evidence"]["date_distribution"]["fills"]["counts"] == {"2026-07-03": 1}
     assert sorted(result.pending_versions) == ["daytrade-v2", "scout-v2"]
     assert store.get_active_strategy_version("scout").version == "scout-v2"
     assert store.get_active_strategy_version("daytrade").version == "daytrade-v2"
@@ -159,6 +163,9 @@ def test_multi_agent_review_creates_pending_versions_without_activation(tmp_path
     statuses = {(row["strategy"], row["status"]) for row in store.list_strategy_proposals(run["id"])}
     assert ("scout", "version_created_applied") in statuses
     assert ("daytrade", "version_created_applied") in statuses
+    swing_review = [row for row in store.list_daily_reviews(limit=10) if row["strategy"] == "swing"][0]
+    assert "review_only" not in swing_review["summary"]
+    assert "已討論，不需改版" in swing_review["summary"]
     assert backend.calls[0]["allow_web_search"] is False
 
 

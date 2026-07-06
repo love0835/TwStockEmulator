@@ -914,7 +914,7 @@ class WatchDeskApp:
                         _strategy_label(row["strategy"]),
                         row["strategy_version"],
                         _proposal_status_label(row["proposal_status"]),
-                        row["summary"],
+                        _display_text(row["summary"]),
                     ),
                 )
                 for row in daily_reviews
@@ -1245,7 +1245,7 @@ def _format_latest_strategy_review(row: object, timezone_name: str) -> str:
     review_date = str(row["review_date"] or "-")
     status = _proposal_status_label(row["proposal_status"])
     created_at = _format_db_time(row["created_at"], timezone_name)
-    summary = str(row["summary"] or "-")
+    summary = _display_text(row["summary"])
     llm_summary = str(row["llm_summary"] or "-")
     discussion = str(row["llm_discussion"] or "-")
     strategy_version = str(row["strategy_version"] or "-")
@@ -1294,7 +1294,7 @@ def _format_daily_review_detail(
         f"策略：{_strategy_label(row['strategy'])}\n"
         f"策略版本：{row['strategy_version'] or '-'}\n"
         f"提案狀態：{_proposal_status_label(row['proposal_status'])}\n\n"
-        f"摘要\n{row['summary'] or '-'}\n\n"
+        f"摘要\n{_display_text(row['summary'])}\n\n"
         f"績效 / 指標\n{_format_json_text(row['metrics_json'])}\n\n"
         f"LLM 摘要\n{row['llm_summary'] or '-'}\n\n"
         f"檢討過程 / 失敗原因\n{row['llm_discussion'] or '-'}\n\n"
@@ -1383,6 +1383,32 @@ def _format_json_text(value: object) -> str:
         return json.dumps(_localize_json_for_display(json.loads(text)), ensure_ascii=False, indent=2)
     except json.JSONDecodeError:
         return _display_value_label(text)
+
+
+def _display_text(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "-"
+    replacements = {
+        "record_review_only": "已討論，不需改版",
+        "insufficient_evidence": "證據不足",
+        "propose_change": "建議建立新版",
+        "version_reused_applied": "沿用既有新版並套用",
+        "version_reused_locked": "沿用既有新版但目前鎖定",
+        "version_created_applied": "已建立並套用",
+        "version_created_locked": "已建立未套用",
+        "pending_version_reused": "沿用既有新版",
+        "pending_version_created": "已建立新版",
+        "validation_failed": "驗證失敗",
+        "risk_rejected": "風控拒絕",
+        "review_only": "已討論，不需改版",
+        "no_change": "已討論，不需改版",
+        "llm_error": "LLM 失敗",
+        "insufficient_data": "資料不足",
+    }
+    for raw, label in replacements.items():
+        text = text.replace(raw, label)
+    return text
 
 
 def _localize_json_for_display(value: object) -> object:

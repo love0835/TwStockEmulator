@@ -1,6 +1,6 @@
 import json
 
-from tw_watchdesk.app import _format_agent_reviews, _format_json_text, _proposal_status_label
+from tw_watchdesk.app import _display_text, _format_agent_reviews, _format_json_text, _proposal_status_label
 
 
 def test_review_status_labels_hide_internal_review_only_code() -> None:
@@ -25,6 +25,13 @@ def test_review_json_format_hides_internal_review_only_codes() -> None:
     assert "已討論，不需改版" in text
     assert "沿用既有新版並套用" in text
     assert "證據不足" in text
+
+
+def test_display_text_hides_internal_review_status_codes() -> None:
+    text = _display_text("2026-07-06 當沖 多 Agent 盤後檢討：review_only")
+
+    assert "review_only" not in text
+    assert text == "2026-07-06 當沖 多 Agent 盤後檢討：已討論，不需改版"
 
 
 def test_agent_review_format_hides_internal_action_codes() -> None:
