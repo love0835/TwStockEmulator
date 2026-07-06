@@ -544,8 +544,61 @@ def _run_command(command: list[str], *, input_text: str, timeout: int, cwd: Path
 
 def _codex_executable() -> str:
     if os.name == "nt":
+        _refresh_windows_path_from_persistent_environment()
         return shutil.which("codex.cmd") or shutil.which("codex.exe") or "codex.cmd"
     return shutil.which("codex") or "codex"
+
+
+def _refresh_windows_path_from_persistent_environment() -> None:
+    if os.name != "nt":
+        return
+    entries: list[str] = []
+    app_data = os.environ.get("APPDATA")
+    if app_data:
+        entries.append(str(Path(app_data) / "npm"))
+    program_files = os.environ.get("ProgramFiles")
+    if program_files:
+        entries.append(str(Path(program_files) / "nodejs"))
+    for text in (_windows_environment_path("user"), _windows_environment_path("machine")):
+        entries.extend(part.strip() for part in text.split(os.pathsep) if part.strip())
+    _prepend_path_entries(entries)
+
+
+def _windows_environment_path(scope: str) -> str:
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg
+
+        if scope == "user":
+            root = winreg.HKEY_CURRENT_USER
+            subkey = "Environment"
+        else:
+            root = winreg.HKEY_LOCAL_MACHINE
+            subkey = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+        with winreg.OpenKey(root, subkey) as key:
+            value, _ = winreg.QueryValueEx(key, "Path")
+    except (ImportError, OSError):
+        return ""
+    return os.path.expandvars(str(value))
+
+
+def _prepend_path_entries(entries: list[str]) -> None:
+    current_parts = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
+    seen = {_normalize_path(part) for part in current_parts}
+    prepend: list[str] = []
+    for entry in entries:
+        normalized = _normalize_path(entry)
+        if not normalized or normalized in seen:
+            continue
+        prepend.append(entry)
+        seen.add(normalized)
+    if prepend:
+        os.environ["PATH"] = os.pathsep.join(prepend + current_parts)
+
+
+def _normalize_path(path: str) -> str:
+    return str(Path(path).expanduser()).rstrip("\\/").lower()
 
 
 def _windows_subprocess_options() -> dict[str, Any]:

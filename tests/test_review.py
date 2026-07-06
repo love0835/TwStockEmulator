@@ -140,11 +140,16 @@ def test_multi_agent_review_creates_pending_versions_without_activation(tmp_path
     result = MultiAgentReviewOrchestrator(store=store, settings=Settings(market_data_mode="fake"), backend=backend).run("2026-07-03")
 
     assert result.status == "completed"
+    assert backend.calls
+    for call in backend.calls:
+        payload = json.loads(call["prompt"])
+        assert payload["output_language"] == "zh-Hant-TW"
+        assert any("Traditional Chinese" in rule for rule in payload["hard_rules"])
     assert sorted(result.pending_versions) == ["daytrade-v2", "scout-v2"]
-    assert store.get_active_strategy_version("scout").version == "scout-v1"
-    assert store.get_active_strategy_version("daytrade").version == "daytrade-v1"
-    assert store.get_strategy_version("scout", "scout-v2").status == "pending"
-    assert store.get_strategy_version("daytrade", "daytrade-v2").status == "pending"
+    assert store.get_active_strategy_version("scout").version == "scout-v2"
+    assert store.get_active_strategy_version("daytrade").version == "daytrade-v2"
+    assert store.get_strategy_version("scout", "scout-v2").status == "validated"
+    assert store.get_strategy_version("daytrade", "daytrade-v2").status == "validated"
     run = store.list_review_runs(review_date="2026-07-03")[0]
     assert run["status"] == "completed"
     evidence = json.loads(store.get_review_evidence(run["evidence_id"])["evidence_json"])
@@ -152,8 +157,8 @@ def test_multi_agent_review_creates_pending_versions_without_activation(tmp_path
     assert evidence["attribution_summary"]["fills"]["status_counts"]["complete"] == 1
     assert len(store.list_agent_reviews(run["id"])) == 5
     statuses = {(row["strategy"], row["status"]) for row in store.list_strategy_proposals(run["id"])}
-    assert ("scout", "pending_version_created") in statuses
-    assert ("daytrade", "pending_version_created") in statuses
+    assert ("scout", "version_created_applied") in statuses
+    assert ("daytrade", "version_created_applied") in statuses
     assert backend.calls[0]["allow_web_search"] is False
 
 
@@ -205,3 +210,56 @@ def test_multi_agent_review_rejects_news_only_strategy_support(tmp_path) -> None
     proposal = [row for row in store.list_strategy_proposals(result.review_run_id) if row["strategy"] == "scout"][0]
     assert proposal["status"] == "validation_failed"
     assert "NewsContextAgent" in proposal["validation_json"]
+
+
+def test_multi_agent_review_respects_manual_lock(tmp_path) -> None:
+    store = TradingStore(tmp_path / "lab.sqlite3")
+    store.initialize()
+    store.set_strategy_version_state("daytrade", "daytrade-v1", "manual_lock")
+    at = datetime(2026, 7, 3, 6, 30, tzinfo=timezone.utc)
+    _seed_review_evidence(store, at)
+    daytrade_changes = _none_changes(
+        [
+            "stop_loss_pct",
+            "take_profit_pct",
+            "risk_pct",
+            "max_position_pct",
+            "max_daily_loss_pct",
+            "entry_start_time",
+            "entry_end_time",
+            "force_exit_time",
+            "order_ttl_minutes",
+            "max_spread_pct",
+            "max_quote_age_seconds",
+            "missing_depth_policy",
+            "reentry_cooldown_minutes",
+            "consecutive_loss_stop",
+            "allow_limit_up_entry",
+            "allow_limit_down_entry",
+        ]
+    )
+    daytrade_changes["max_spread_pct"] = 0.005
+    backend = FakeJsonBackend(
+        {
+            "ScoutAgent": _agent_payload("record_review_only", {}),
+            "DaytradeAgent": _agent_payload("propose_change", daytrade_changes),
+            "SwingAgent": _agent_payload("record_review_only", {}),
+            "RiskAgent": {"summary": "pass", "verdict": "pass", "confidence": 0.9, "rejections": [], "warnings": []},
+            "CoachAgent": {
+                "summary": "route",
+                "confidence": 0.9,
+                "proposals": [
+                    {"strategy": "daytrade", "action": "propose_change", "summary": "daytrade locked", "supporting_agent": "DaytradeAgent"}
+                ],
+                "rejected": [],
+            },
+        }
+    )
+
+    result = MultiAgentReviewOrchestrator(store=store, settings=Settings(market_data_mode="fake"), backend=backend).run("2026-07-03")
+
+    assert result.pending_versions == ["daytrade-v2"]
+    assert store.get_active_strategy_version("daytrade").version == "daytrade-v1"
+    assert store.get_strategy_version("daytrade", "daytrade-v2").status == "validated"
+    proposals = store.list_strategy_proposals(result.review_run_id)
+    assert any(row["strategy"] == "daytrade" and row["status"] == "version_created_locked" for row in proposals)

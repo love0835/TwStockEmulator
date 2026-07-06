@@ -14,6 +14,7 @@ from tw_watchdesk.setup_env import (
     build_fugle_mcp_env,
     call_with_timeout,
     copy_certificate_to_project_store,
+    prepend_path_entries,
     read_mcp_message,
     redact_setup_text,
     replace_fugle_mcp_block,
@@ -278,6 +279,18 @@ def test_read_mcp_message_skips_notifications_until_expected_id() -> None:
 def test_call_with_timeout_raises_instead_of_blocking_forever() -> None:
     with pytest.raises(TimeoutError):
         call_with_timeout(lambda: (time.sleep(1), b"")[1], timeout_seconds=0.01)
+
+
+def test_prepend_path_entries_adds_missing_entries_without_duplicates(monkeypatch) -> None:
+    monkeypatch.setenv("PATH", r"C:\Windows;C:\Existing")
+
+    prepend_path_entries([r"C:\Users\me\AppData\Roaming\npm", r"C:\Existing", r"C:\Users\me\AppData\Roaming\npm\\"])
+
+    assert setup_env.os.environ["PATH"].split(setup_env.os.pathsep) == [
+        r"C:\Users\me\AppData\Roaming\npm",
+        r"C:\Windows",
+        r"C:\Existing",
+    ]
 
 
 def _clear_llm_process_env(monkeypatch: pytest.MonkeyPatch) -> None:

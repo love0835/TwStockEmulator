@@ -844,7 +844,7 @@ def test_worker_creates_and_applies_valid_swing_strategy_version(tmp_path) -> No
     _seed_swing_buy_fill(store, filled_at)
     adapter = FakeLlmAdapter(CodexResult(True, _valid_swing_review_payload()))
     worker = TradingLabWorker(
-        settings=Settings(enable_auto_scout=False, enable_swing_self_correction=True),
+        settings=Settings(enable_auto_scout=False),
         store=store,
         provider=FakeProvider(_quote(now, symbol="3707", name="漢磊")),
         llm_adapter=adapter,
@@ -870,7 +870,7 @@ def test_worker_can_run_swing_review_immediately(tmp_path) -> None:
     store.upsert_daily_review("2026-07-02", "swing", "base review", {"fills": 1}, strategy_version="swing-v1")
     adapter = FakeLlmAdapter(CodexResult(True, _valid_swing_review_payload()))
     worker = TradingLabWorker(
-        settings=Settings(enable_auto_scout=False, enable_swing_self_correction=True),
+        settings=Settings(enable_auto_scout=False),
         store=store,
         provider=FakeProvider(_quote(filled_at, symbol="3707", name="漢磊")),
         llm_adapter=adapter,
@@ -893,7 +893,7 @@ def test_worker_swing_review_immediate_uses_recent_window(tmp_path) -> None:
     store.upsert_daily_review("2026-06-24", "swing", "base review", {"fills": 1}, strategy_version="swing-v1")
     adapter = FakeLlmAdapter(CodexResult(True, _valid_swing_review_payload()))
     worker = TradingLabWorker(
-        settings=Settings(enable_auto_scout=False, enable_swing_self_correction=False),
+        settings=Settings(enable_auto_scout=False),
         store=store,
         provider=FakeProvider(_quote(latest, symbol="3707", name="漢磊")),
         llm_adapter=adapter,
@@ -907,6 +907,8 @@ def test_worker_swing_review_immediate_uses_recent_window(tmp_path) -> None:
     assert payload["evidence"]["data_start"] == "2026-06-11"
     assert payload["evidence"]["data_end"] == "2026-06-24"
     assert len(payload["evidence"]["fills"]) == 2
+    assert payload["output_language"] == "zh-Hant-TW"
+    assert any("Traditional Chinese" in rule for rule in payload["hard_rules"])
 
 
 def test_worker_can_run_daytrade_review_immediately(tmp_path) -> None:
@@ -927,6 +929,9 @@ def test_worker_can_run_daytrade_review_immediately(tmp_path) -> None:
 
     assert "當沖會後討論完成" in message
     assert adapter.calls == 1
+    payload = json.loads(adapter.prompts[0])
+    assert payload["output_language"] == "zh-Hant-TW"
+    assert any("Traditional Chinese" in rule for rule in payload["hard_rules"])
     review = [row for row in store.list_daily_reviews() if row["strategy"] == "daytrade"][0]
     assert review["proposal_status"] == "reviewed"
     assert "追價太快" in review["llm_discussion"]
@@ -941,7 +946,7 @@ def test_worker_manual_lock_keeps_selected_swing_version_when_new_version_is_cre
     _seed_swing_buy_fill(store, filled_at)
     adapter = FakeLlmAdapter(CodexResult(True, _valid_swing_review_payload()))
     worker = TradingLabWorker(
-        settings=Settings(enable_auto_scout=False, enable_swing_self_correction=True),
+        settings=Settings(enable_auto_scout=False),
         store=store,
         provider=FakeProvider(_quote(now, symbol="3707", name="漢磊")),
         llm_adapter=adapter,
@@ -965,7 +970,7 @@ def test_worker_rejects_invalid_swing_strategy_version_payload(tmp_path) -> None
     payload = {**_valid_swing_review_payload(), "parameter_changes": {"stop_loss_pct": 0.99}}
     adapter = FakeLlmAdapter(CodexResult(True, payload))
     worker = TradingLabWorker(
-        settings=Settings(enable_auto_scout=False, enable_swing_self_correction=True),
+        settings=Settings(enable_auto_scout=False),
         store=store,
         provider=FakeProvider(_quote(now, symbol="3707", name="漢磊")),
         llm_adapter=adapter,

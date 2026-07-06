@@ -17,7 +17,6 @@ def test_load_settings_from_env_file(tmp_path) -> None:
                 "TW_WATCH_SCOUT_MAX_DAYTRADE=3",
                 "TW_WATCH_SCOUT_MAX_SWING=4",
                 "TW_WATCH_SCOUT_EXCLUDED_SYMBOLS_FILE=data/custom_excluded.txt",
-                "TW_WATCH_ENABLE_SWING_SELF_CORRECTION=true",
                 "TAISHIN_NOVA_USER=u",
             ]
         ),
@@ -38,7 +37,6 @@ def test_load_settings_from_env_file(tmp_path) -> None:
     assert settings.scout_max_daytrade == 3
     assert settings.scout_max_swing == 4
     assert settings.scout_excluded_symbols_file == tmp_path / "data/custom_excluded.txt"
-    assert settings.enable_swing_self_correction is True
     assert settings.nova_user == "u"
 
 

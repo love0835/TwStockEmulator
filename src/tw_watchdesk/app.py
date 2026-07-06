@@ -136,8 +136,6 @@ class WatchDeskApp:
         self.lab_status_var = StringVar(value=f"交易實驗室就緒：{self.store.path}")
         self.auto_scout_enabled_var = BooleanVar(value=self.settings.enable_auto_scout)
         self.auto_scout_status_var = StringVar(value="自動選股已啟用" if self.settings.enable_auto_scout else "自動選股未啟用")
-        self.swing_self_correction_enabled_var = BooleanVar(value=self.settings.enable_swing_self_correction)
-        self.swing_self_correction_status_var = StringVar(value="短線自我修正已啟用" if self.settings.enable_swing_self_correction else "短線自我修正未啟用")
         self.daytrade_delta_var = StringVar(value="100000")
         self.swing_delta_var = StringVar(value="100000")
         self.monitor_running_var = StringVar(value="未啟動")
@@ -230,9 +228,9 @@ class WatchDeskApp:
 
         controls = ttk.Frame(parent)
         controls.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        for idx in range(16):
+        for idx in range(12):
             controls.columnconfigure(idx, weight=0)
-        controls.columnconfigure(15, weight=1)
+        controls.columnconfigure(11, weight=1)
 
         ttk.Label(controls, text="候選股票").grid(row=0, column=0, padx=(0, 6))
         ttk.Entry(controls, textvariable=self.lab_symbol_var, width=10).grid(row=0, column=1, padx=(0, 12))
@@ -244,12 +242,8 @@ class WatchDeskApp:
         ttk.Checkbutton(controls, text="啟用自動選股", variable=self.auto_scout_enabled_var, command=self.toggle_auto_scout).grid(row=0, column=7, padx=(0, 8))
         ttk.Button(controls, text="立即選股", command=self.run_auto_scout_now).grid(row=0, column=8, padx=(0, 8))
         ttk.Label(controls, textvariable=self.auto_scout_status_var, wraplength=180).grid(row=0, column=9, sticky="w", padx=(0, 8))
-        ttk.Checkbutton(controls, text="啟用短線自我修正", variable=self.swing_self_correction_enabled_var, command=self.toggle_swing_self_correction).grid(row=0, column=10, padx=(0, 8))
-        ttk.Button(controls, text="立即當沖討論", command=self.run_daytrade_review_now).grid(row=0, column=11, padx=(0, 8))
-        ttk.Button(controls, text="立即短線討論", command=self.run_swing_review_now).grid(row=0, column=12, padx=(0, 8))
-        ttk.Button(controls, text="多 Agent 檢討", command=self.run_multi_agent_review_now).grid(row=0, column=13, padx=(0, 8))
-        ttk.Label(controls, textvariable=self.swing_self_correction_status_var, wraplength=160).grid(row=0, column=14, sticky="w", padx=(0, 8))
-        ttk.Label(controls, textvariable=self.lab_status_var, wraplength=320).grid(row=0, column=15, sticky="w")
+        ttk.Button(controls, text="立即完整討論", command=self.run_full_review_now).grid(row=0, column=10, padx=(0, 8))
+        ttk.Label(controls, textvariable=self.lab_status_var, wraplength=420).grid(row=0, column=11, sticky="w")
 
         body = ttk.Frame(parent)
         body.grid(row=1, column=0, sticky="nsew")
@@ -578,28 +572,6 @@ class WatchDeskApp:
         )
         self._refresh_lab_views()
 
-    def toggle_swing_self_correction(self) -> None:
-        enabled = self.swing_self_correction_enabled_var.get()
-        target_path = nova_settings_file(self.settings)
-        save_app_settings(target_path, {"TW_WATCH_ENABLE_SWING_SELF_CORRECTION": "true" if enabled else "false"})
-        self.settings = load_settings()
-        self.lab_worker.settings = self.settings
-        self.swing_self_correction_enabled_var.set(self.settings.enable_swing_self_correction)
-        self.swing_self_correction_status_var.set("短線自我修正已啟用" if self.settings.enable_swing_self_correction else "短線自我修正未啟用")
-        now = datetime.now(timezone.utc)
-        self.store.add_monitor_event(
-            actor="system",
-            phase="daily_review",
-            event_type="swing_self_correction_toggle",
-            title="短線自我修正設定更新",
-            detail=self.swing_self_correction_status_var.get(),
-            strategy="swing",
-            created_at=now,
-            trade_date=now.astimezone(ZoneInfo(self.settings.timezone)).date().isoformat(),
-            metrics={"enabled": self.settings.enable_swing_self_correction},
-        )
-        self._refresh_lab_views()
-
     def run_auto_scout_now(self) -> None:
         self.auto_scout_status_var.set("立即選股執行中")
         thread = threading.Thread(target=self._run_auto_scout_now_thread, daemon=True)
@@ -627,84 +599,29 @@ class WatchDeskApp:
         self.auto_scout_status_var.set(message)
         self._refresh_lab_views()
 
-    def run_swing_review_now(self) -> None:
-        self.swing_self_correction_status_var.set("短線會後討論執行中")
-        thread = threading.Thread(target=self._run_swing_review_now_thread, daemon=True)
+    def run_full_review_now(self) -> None:
+        self.lab_status_var.set("完整會後討論執行中")
+        thread = threading.Thread(target=self._run_full_review_now_thread, daemon=True)
         thread.start()
 
-    def run_daytrade_review_now(self) -> None:
-        self.lab_status_var.set("當沖會後討論執行中")
-        thread = threading.Thread(target=self._run_daytrade_review_now_thread, daemon=True)
-        thread.start()
-
-    def run_multi_agent_review_now(self) -> None:
-        self.lab_status_var.set("多 Agent 策略檢討執行中")
-        thread = threading.Thread(target=self._run_multi_agent_review_now_thread, daemon=True)
-        thread.start()
-
-    def _run_daytrade_review_now_thread(self) -> None:
+    def _run_full_review_now_thread(self) -> None:
         try:
-            message = self.lab_worker.run_daytrade_review_now()
+            message = self.lab_worker.run_full_review_now()
         except Exception as exc:
-            message = f"當沖會後討論失敗：{exc.__class__.__name__}: {exc}"
+            message = f"完整會後討論失敗：{exc.__class__.__name__}: {exc}"
             self.store.add_monitor_event(
                 actor="system",
                 phase="daily_review",
-                event_type="daytrade_review_manual_error",
-                title="立即當沖討論失敗",
-                detail=message,
-                severity="error",
-                strategy="daytrade",
-                created_at=datetime.now(timezone.utc),
-                trade_date=datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat(),
-            )
-        self.root.after(0, lambda: self._finish_daytrade_review_now(message))
-
-    def _finish_daytrade_review_now(self, message: str) -> None:
-        self.lab_status_var.set(message)
-        self._refresh_lab_views()
-
-    def _run_multi_agent_review_now_thread(self) -> None:
-        try:
-            message = self.lab_worker.run_multi_agent_review_now()
-        except Exception as exc:
-            message = f"多 Agent 策略檢討失敗：{exc.__class__.__name__}: {exc}"
-            self.store.add_monitor_event(
-                actor="system",
-                phase="daily_review",
-                event_type="multi_agent_review_manual_error",
-                title="手動多 Agent 檢討失敗",
+                event_type="full_review_manual_error",
+                title="立即完整討論失敗",
                 detail=message,
                 severity="error",
                 created_at=datetime.now(timezone.utc),
                 trade_date=datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat(),
             )
-        self.root.after(0, lambda: self._finish_multi_agent_review_now(message))
+        self.root.after(0, lambda: self._finish_full_review_now(message))
 
-    def _finish_multi_agent_review_now(self, message: str) -> None:
-        self.lab_status_var.set(message)
-        self._refresh_lab_views()
-
-    def _run_swing_review_now_thread(self) -> None:
-        try:
-            message = self.lab_worker.run_swing_review_now()
-        except Exception as exc:
-            message = f"短線會後討論失敗：{exc.__class__.__name__}: {exc}"
-            self.store.add_monitor_event(
-                actor="system",
-                phase="daily_review",
-                event_type="swing_review_manual_error",
-                title="立即短線討論失敗",
-                detail=message,
-                severity="error",
-                strategy="swing",
-                created_at=datetime.now(timezone.utc),
-                trade_date=datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat(),
-            )
-        self.root.after(0, lambda: self._finish_swing_review_now(message))
-
-    def _finish_swing_review_now(self, message: str) -> None:
-        self.swing_self_correction_status_var.set(message)
+    def _finish_full_review_now(self, message: str) -> None:
         self.lab_status_var.set(message)
         self._refresh_lab_views()
 
@@ -763,8 +680,6 @@ class WatchDeskApp:
         self.lab_worker.provider = self.provider
         self.auto_scout_enabled_var.set(self.settings.enable_auto_scout)
         self.auto_scout_status_var.set("自動選股已啟用" if self.settings.enable_auto_scout else "自動選股未啟用")
-        self.swing_self_correction_enabled_var.set(self.settings.enable_swing_self_correction)
-        self.swing_self_correction_status_var.set("短線自我修正已啟用" if self.settings.enable_swing_self_correction else "短線自我修正未啟用")
         self.monitor_mode_var.set(self.settings.market_data_mode)
         env_label = "設定檔：" + "、".join(str(path) for path in self.settings.loaded_env_files)
         self.status_var.set(env_label)
@@ -1295,7 +1210,7 @@ def _proposal_status_label(value: object) -> str:
         "no_change": "不改版",
         "review_only": "只記錄檢討",
         "risk_rejected": "風控拒絕",
-        "pending_version_created": "已建立待套用版",
+        "pending_version_created": "已建立新版",
         "version_created_applied": "已建立並套用",
         "version_created_locked": "已建立未套用",
     }.get(str(value), str(value))
@@ -1496,7 +1411,7 @@ def _strategy_mode_label(value: object) -> str:
 def _strategy_version_status_label(value: object) -> str:
     return {
         "validated": "可用",
-        "pending": "待套用",
+        "pending": "舊待審",
         "rejected": "已拒絕",
     }.get(str(value), str(value))
 

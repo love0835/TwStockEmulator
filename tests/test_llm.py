@@ -77,6 +77,25 @@ def test_codex_adapter_uses_cmd_shim_on_windows(tmp_path, monkeypatch) -> None:
     assert captured["executable"] == r"C:\node\codex.cmd"
 
 
+def test_codex_executable_refreshes_windows_path_before_lookup(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_refresh() -> None:
+        calls.append("refresh")
+
+    def fake_which(name: str) -> str | None:
+        if calls and name == "codex.cmd":
+            return r"C:\Users\me\AppData\Roaming\npm\codex.cmd"
+        return None
+
+    monkeypatch.setattr(llm.os, "name", "nt")
+    monkeypatch.setattr(llm, "_refresh_windows_path_from_persistent_environment", fake_refresh)
+    monkeypatch.setattr(llm.shutil, "which", fake_which)
+
+    assert llm._codex_executable() == r"C:\Users\me\AppData\Roaming\npm\codex.cmd"
+    assert calls == ["refresh"]
+
+
 def test_run_command_uses_utf8_and_hides_window_on_windows(tmp_path, monkeypatch) -> None:
     captured: dict[str, object] = {}
 

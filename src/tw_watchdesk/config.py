@@ -26,7 +26,6 @@ APP_ENV_KEYS = NOVA_ENV_KEYS + (
     "TW_WATCH_SCOUT_MAX_DAYTRADE",
     "TW_WATCH_SCOUT_MAX_SWING",
     "TW_WATCH_SCOUT_EXCLUDED_SYMBOLS_FILE",
-    "TW_WATCH_ENABLE_SWING_SELF_CORRECTION",
 )
 
 
@@ -49,7 +48,6 @@ class Settings:
     realtime_capture_channels: tuple[str, ...] = ("trades", "books", "aggregates", "candles")
     realtime_capture_max_symbols: int = 50
     enable_auto_scout: bool = False
-    enable_swing_self_correction: bool = False
     auto_scout_time: str = "09:05"
     scout_max_daytrade: int = 5
     scout_max_swing: int = 5
@@ -106,7 +104,6 @@ def load_settings(base_dir: Path | None = None) -> Settings:
         realtime_capture_channels=_csv_tuple(env.get("TW_WATCH_REALTIME_CAPTURE_CHANNELS"), ("trades", "books", "aggregates", "candles")),
         realtime_capture_max_symbols=_int(env.get("TW_WATCH_REALTIME_CAPTURE_MAX_SYMBOLS"), 50),
         enable_auto_scout=_bool(env.get("TW_WATCH_ENABLE_AUTO_SCOUT"), False),
-        enable_swing_self_correction=_bool(env.get("TW_WATCH_ENABLE_SWING_SELF_CORRECTION"), False),
         auto_scout_time=env.get("TW_WATCH_AUTO_SCOUT_TIME", "09:05").strip(),
         scout_max_daytrade=_int(env.get("TW_WATCH_SCOUT_MAX_DAYTRADE"), 5),
         scout_max_swing=_int(env.get("TW_WATCH_SCOUT_MAX_SWING"), 5),

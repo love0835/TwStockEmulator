@@ -329,6 +329,7 @@ def _sdk_method(sdk: object, *names: str) -> Callable[[object], object]:
 
 
 def ensure_node_and_npm(npm_path: str | None, install_with_winget: bool) -> tuple[StepResult, str | None]:
+    refresh_path_from_persistent_environment()
     if npm_path:
         version = command_output([npm_path, "--version"], timeout_seconds=20)
         detail = f"npm 可用：{npm_path}"
@@ -374,6 +375,7 @@ def ensure_node_and_npm(npm_path: str | None, install_with_winget: bool) -> tupl
             None,
         )
 
+    refresh_path_from_persistent_environment()
     refresh_path_from_winget_node()
     npm_path = find_command("npm")
     if not npm_path:
@@ -390,6 +392,7 @@ def install_or_update_fugle_mcp(npm_path: str | None) -> StepResult:
     result = run_subprocess([npm_path, "install", "-g", FUGLE_MCP_PACKAGE], timeout_seconds=600)
     if result.returncode != 0:
         return StepResult("Fugle MCP 安裝", "error", f"npm install 失敗：{result.stderr or result.stdout}")
+    refresh_path_from_persistent_environment()
     refresh_path_from_winget_node()
     command = find_fugle_mcp_command()
     if not command:
@@ -688,6 +691,7 @@ def find_codex_cli_command() -> str | None:
 
 
 def find_command(name: str) -> str | None:
+    refresh_path_from_persistent_environment()
     direct = shutil.which(name)
     if direct:
         return direct
@@ -696,6 +700,7 @@ def find_command(name: str) -> str | None:
 
 
 def where_all(name: str) -> list[str]:
+    refresh_path_from_persistent_environment()
     try:
         result = subprocess.run(["where.exe", name], capture_output=True, text=True, timeout=10, check=False)
     except (OSError, subprocess.SubprocessError):
@@ -703,6 +708,61 @@ def where_all(name: str) -> list[str]:
     if result.returncode != 0:
         return []
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def refresh_path_from_persistent_environment() -> None:
+    if os.name != "nt":
+        return
+    entries: list[str] = []
+    app_data = os.environ.get("APPDATA")
+    if app_data:
+        entries.append(str(Path(app_data) / "npm"))
+    program_files = os.environ.get("ProgramFiles")
+    if program_files:
+        entries.append(str(Path(program_files) / "nodejs"))
+    for text in (
+        read_windows_environment_path("user"),
+        read_windows_environment_path("machine"),
+    ):
+        entries.extend(part.strip() for part in text.split(os.pathsep) if part.strip())
+    prepend_path_entries(entries)
+
+
+def read_windows_environment_path(scope: Literal["user", "machine"]) -> str:
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg
+
+        if scope == "user":
+            root = winreg.HKEY_CURRENT_USER
+            subkey = "Environment"
+        else:
+            root = winreg.HKEY_LOCAL_MACHINE
+            subkey = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+        with winreg.OpenKey(root, subkey) as key:
+            value, _ = winreg.QueryValueEx(key, "Path")
+    except (ImportError, OSError):
+        return ""
+    return os.path.expandvars(str(value))
+
+
+def prepend_path_entries(entries: list[str]) -> None:
+    current_parts = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
+    seen = {normalize_path_for_compare(part) for part in current_parts}
+    prepend: list[str] = []
+    for entry in entries:
+        normalized = normalize_path_for_compare(entry)
+        if not normalized or normalized in seen:
+            continue
+        prepend.append(entry)
+        seen.add(normalized)
+    if prepend:
+        os.environ["PATH"] = os.pathsep.join(prepend + current_parts)
+
+
+def normalize_path_for_compare(path: str) -> str:
+    return str(Path(path).expanduser()).rstrip("\\/").lower()
 
 
 def refresh_path_from_winget_node() -> None:

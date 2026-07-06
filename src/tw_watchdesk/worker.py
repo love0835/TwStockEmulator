@@ -46,6 +46,7 @@ from tw_watchdesk.strategy_versions import (
 
 STRATEGY_LABELS = {"daytrade": "當沖", "swing": "短線"}
 REVIEW_LOOKBACK_DAYS = 14
+TRADITIONAL_CHINESE_OUTPUT_RULE = "All user-visible text fields must be written in Traditional Chinese (Taiwan); do not answer summaries, mistakes, rule suggestions, discussion, or capital suggestions in English."
 
 
 @dataclass(frozen=True)
@@ -224,6 +225,29 @@ class TradingLabWorker:
         trade_date = now.astimezone(ZoneInfo(self.settings.timezone)).date().isoformat()
         self._run_scout(trade_date, now, manual=True)
 
+    def run_full_review_now(self, trade_date: str | None = None) -> str:
+        now = datetime.now(timezone.utc)
+        if trade_date is None:
+            trade_date = self._latest_review_trade_date(now)
+        self._set_status("system", "daily_review", f"立即執行完整會後討論 {trade_date}", now=now)
+        self._log_event(
+            "system",
+            "daily_review",
+            "full_review_requested",
+            "立即完整會後討論",
+            detail=f"{trade_date} 立即執行完整會後討論流程。",
+            created_at=now,
+            trade_date=trade_date,
+        )
+        self._write_daily_reviews(trade_date)
+        reviews = [
+            row
+            for row in self.store.list_daily_reviews(limit=500)
+            if str(row["review_date"]) == trade_date and str(row["strategy"]) in {"daytrade", "swing"}
+        ]
+        status_text = "、".join(f"{_strategy_label(str(row['strategy']))}:{row['proposal_status']}" for row in reviews) or "已送出"
+        return f"{trade_date} 完整會後討論完成：{status_text}"
+
     def run_swing_review_now(self, trade_date: str | None = None) -> str:
         now = datetime.now(timezone.utc)
         if trade_date is None:
@@ -270,6 +294,7 @@ class TradingLabWorker:
             metrics=metrics,
         )
         self._maybe_run_swing_self_correction(trade_date, summary, metrics, force=True)
+        self._run_multi_agent_review(trade_date)
         rows = [row for row in self.store.list_daily_reviews(limit=500) if str(row["strategy"]) == "swing" and str(row["review_date"]) == trade_date]
         if not rows:
             return f"{trade_date} 短線會後討論已執行"
@@ -323,6 +348,7 @@ class TradingLabWorker:
             metrics=metrics,
         )
         self._maybe_run_daytrade_review(trade_date, summary, metrics, force=True)
+        self._run_multi_agent_review(trade_date)
         rows = [row for row in self.store.list_daily_reviews(limit=500) if str(row["strategy"]) == "daytrade" and str(row["review_date"]) == trade_date]
         if not rows:
             return f"{trade_date} 當沖會後討論已執行"
@@ -347,6 +373,21 @@ class TradingLabWorker:
             metrics={"review_run_id": result.review_run_id, "pending_versions": result.pending_versions, "rejected": result.rejected},
         )
         return f"{trade_date} 多 Agent 策略檢討完成：{result.summary}"
+
+    def _latest_review_trade_date(self, now: datetime) -> str:
+        dates: list[str] = []
+        for row in self.store.list_daily_reviews(limit=500):
+            value = str(row["review_date"])
+            if value:
+                dates.append(value)
+        fills = self.store.list_fills(500)
+        orders = self.store.list_orders(limit=500)
+        for strategy in ("daytrade", "swing"):
+            dates.extend(_dates_from_rows(fills, "filled_at", strategy))
+            dates.extend(_dates_from_rows(orders, "created_at", strategy))
+        candidates = self.store.list_candidates()
+        dates.extend(str(row.trade_date) for row in candidates if str(row.trade_date))
+        return max(dates) if dates else now.astimezone(ZoneInfo(self.settings.timezone)).date().isoformat()
 
     def _refresh_realtime_capture_subscriptions(self, now: datetime) -> None:
         if not self.settings.enable_realtime_capture or self.settings.market_data_mode != "live":
@@ -1334,6 +1375,7 @@ class TradingLabWorker:
         raise RuntimeError(f"未知 LLM backend：{backend}")
 
     def _write_daily_reviews(self, trade_date: str) -> None:
+        review_inputs: dict[str, tuple[str, dict[str, object]]] = {}
         for account_id, strategy in ((DAYTRADE_ACCOUNT, "daytrade"), (SWING_ACCOUNT, "swing")):
             account = self.store.get_account(account_id)
             fills = [row for row in self.store.list_fills(500) if str(row["strategy"]) == strategy and str(row["filled_at"]).startswith(trade_date)]
@@ -1361,35 +1403,50 @@ class TradingLabWorker:
                 trade_date=trade_date,
                 metrics=metrics,
             )
-            if self.settings.enable_multi_agent_review:
-                continue
-            if strategy == "swing":
-                self._maybe_run_swing_self_correction(trade_date, summary, metrics)
-            elif strategy == "daytrade" and self.settings.enable_codex_llm:
-                self._maybe_run_daytrade_review(trade_date, summary, metrics)
-        if self.settings.enable_multi_agent_review:
-            try:
-                orchestrator = MultiAgentReviewOrchestrator(store=self.store, settings=self.settings, backend=self._llm_backend())
-                result = orchestrator.run(trade_date, include_news_context=self.settings.enable_news_context)
+            review_inputs[strategy] = (summary, metrics)
+        daytrade_input = review_inputs.get("daytrade")
+        if daytrade_input is not None and self.settings.enable_codex_llm:
+            self._maybe_run_daytrade_review(trade_date, daytrade_input[0], daytrade_input[1], force=True)
+        swing_input = review_inputs.get("swing")
+        if swing_input is not None and (self.llm_adapter is not None or self.settings.enable_codex_llm):
+            self._maybe_run_swing_self_correction(trade_date, swing_input[0], swing_input[1], force=True)
+        self._run_multi_agent_review(trade_date)
+
+    def _run_multi_agent_review(self, trade_date: str) -> None:
+        try:
+            backend = self._llm_backend() if self.settings.enable_multi_agent_review else None
+            if backend is None:
                 self._log_event(
                     "system",
                     "daily_review",
-                    "multi_agent_review_completed",
-                    "多 Agent 策略檢討完成",
-                    detail=result.summary,
-                    trade_date=trade_date,
-                    metrics={"review_run_id": result.review_run_id, "pending_versions": result.pending_versions, "rejected": result.rejected},
-                )
-            except Exception as exc:
-                self._log_event(
-                    "system",
-                    "daily_review",
-                    "multi_agent_review_error",
-                    "多 Agent 策略檢討失敗",
-                    detail=str(exc),
+                    "multi_agent_review_unavailable",
+                    "多 Agent 策略檢討未執行",
+                    detail="No LLM backend is enabled for multi-agent review.",
                     severity="warning",
                     trade_date=trade_date,
                 )
+                return
+            orchestrator = MultiAgentReviewOrchestrator(store=self.store, settings=self.settings, backend=backend)
+            result = orchestrator.run(trade_date, include_news_context=self.settings.enable_news_context)
+            self._log_event(
+                "system",
+                "daily_review",
+                "multi_agent_review_completed",
+                "多 Agent 策略檢討完成",
+                detail=result.summary,
+                trade_date=trade_date,
+                metrics={"review_run_id": result.review_run_id, "pending_versions": result.pending_versions, "rejected": result.rejected},
+            )
+        except Exception as exc:
+            self._log_event(
+                "system",
+                "daily_review",
+                "multi_agent_review_error",
+                "多 Agent 策略檢討失敗",
+                detail=str(exc),
+                severity="warning",
+                trade_date=trade_date,
+            )
 
     def _maybe_run_daytrade_review(self, trade_date: str, base_summary: str, base_metrics: dict[str, object], *, force: bool = False) -> None:
         if not force and not self.settings.enable_codex_llm:
@@ -1400,7 +1457,7 @@ class TradingLabWorker:
                 base_metrics,
                 proposal_status="disabled",
                 llm_summary="當沖 LLM 會後討論未啟用",
-                llm_discussion="自動日結未啟用 TW_WATCH_ENABLE_CODEX_LLM；可按「立即當沖討論」手動執行。",
+                llm_discussion="自動日結未啟用 TW_WATCH_ENABLE_CODEX_LLM；可按「立即完整討論」手動執行。",
             )
             return
         evidence = self._strategy_review_evidence("daytrade", trade_date)
@@ -1463,18 +1520,6 @@ class TradingLabWorker:
 
     def _maybe_run_swing_self_correction(self, trade_date: str, base_summary: str, base_metrics: dict[str, object], *, force: bool = False) -> None:
         active = self.store.get_active_strategy_version("swing")
-        if not force and not self.settings.enable_swing_self_correction:
-            self.store.upsert_daily_review(
-                trade_date,
-                "swing",
-                base_summary,
-                base_metrics,
-                proposal_status="disabled",
-                strategy_version=active.version,
-                llm_summary="短線自我修正未啟用",
-                llm_discussion="UI 或設定檔未啟用 TW_WATCH_ENABLE_SWING_SELF_CORRECTION。",
-            )
-            return
         evidence = self._strategy_review_evidence("swing", trade_date)
         if not evidence["fills"] and not evidence["orders"] and not evidence["risk_events"]:
             detail = "短線近 14 天沒有成交、委託或風控事件，略過 LLM 改版。"
@@ -1629,8 +1674,10 @@ class TradingLabWorker:
     def _build_swing_review_prompt(self, trade_date: str, active_version, evidence: dict[str, object]) -> str:
         payload = {
             "task": "Review the Taiwan stock swing simulation result and decide whether to create a new swing strategy parameter version.",
+            "output_language": "zh-Hant-TW",
             "hard_rules": [
                 "Return JSON only.",
+                TRADITIONAL_CHINESE_OUTPUT_RULE,
                 "Do not suggest real-money trading or real order placement.",
                 "Only change whitelisted parameters in parameter_changes.",
                 "Return every parameter_changes key; use null for unchanged parameters.",
@@ -1647,8 +1694,10 @@ class TradingLabWorker:
     def _build_daytrade_review_prompt(self, trade_date: str, evidence: dict[str, object]) -> str:
         payload = {
             "task": "Review the Taiwan stock daytrade simulation result and produce a post-session strategy review.",
+            "output_language": "zh-Hant-TW",
             "hard_rules": [
                 "Return JSON only.",
+                TRADITIONAL_CHINESE_OUTPUT_RULE,
                 "Do not suggest real-money trading or real order placement.",
                 "Focus on simulated daytrade behavior, order quality, risk events, skipped trades, and next rules to test.",
                 "Do not modify Python code or bypass hard risk limits.",
