@@ -420,11 +420,8 @@ class WatchDeskApp:
         widths = (150, 70, 130, 100, 80, 130, 150, 370)
         for column, heading, width in zip(columns, headings, widths):
             tree.heading(column, text=heading)
-            tree.column(column, width=width, anchor="w")
-        tree.grid(row=1, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=tree.yview)
-        scrollbar.grid(row=1, column=1, sticky="ns")
-        tree.configure(yscrollcommand=scrollbar.set)
+            tree.column(column, width=width, minwidth=width, anchor="w", stretch=False)
+        self._grid_tree_with_scrollbars(log_frame, tree, row=1, column=0)
         return tree
 
     def _make_account_tab(self, notebook: ttk.Notebook) -> ttk.Treeview:
@@ -447,8 +444,8 @@ class WatchDeskApp:
             ("pnl", "已實現損益"),
         ):
             tree.heading(column, text=heading)
-            tree.column(column, width=120, anchor="e" if column != "id" else "w")
-        tree.grid(row=1, column=0, sticky="nsew")
+            tree.column(column, width=120, minwidth=120, anchor="e" if column != "id" else "w", stretch=False)
+        self._grid_tree_with_scrollbars(frame, tree, row=1, column=0)
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
         return tree
@@ -458,7 +455,7 @@ class WatchDeskApp:
         notebook.add(frame, text="策略版本")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(2, weight=1)
-        frame.rowconfigure(3, weight=1)
+        frame.rowconfigure(4, weight=1)
 
         status = ttk.LabelFrame(frame, text="目前策略版本", padding=10)
         status.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -489,12 +486,12 @@ class WatchDeskApp:
         widths = (90, 90, 150, 150, 90, 520)
         for column, heading, width in zip(columns, headings, widths):
             tree.heading(column, text=heading)
-            tree.column(column, width=width, anchor="w")
-        tree.grid(row=2, column=0, sticky="nsew")
+            tree.column(column, width=width, minwidth=width, anchor="w", stretch=False)
+        self._grid_tree_with_scrollbars(frame, tree, row=2, column=0)
         tree.bind("<<TreeviewSelect>>", lambda *_: self._refresh_strategy_version_detail())
 
         detail_frame = ttk.Frame(frame)
-        detail_frame.grid(row=3, column=0, sticky="nsew", pady=(8, 0))
+        detail_frame.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
         detail_frame.rowconfigure(0, weight=1)
         detail_frame.columnconfigure(0, weight=1)
         self.strategy_version_detail_text = Text(detail_frame, height=12, wrap="word")
@@ -511,14 +508,19 @@ class WatchDeskApp:
         tree = ttk.Treeview(frame, columns=columns, show="headings", height=9)
         for column, heading in zip(columns, headings):
             tree.heading(column, text=heading)
-            tree.column(column, width=120, anchor="w")
-        tree.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        tree.configure(yscrollcommand=scrollbar.set)
+            tree.column(column, width=120, minwidth=120, anchor="w", stretch=False)
+        self._grid_tree_with_scrollbars(frame, tree, row=0, column=0)
         frame.rowconfigure(0, weight=1)
         frame.columnconfigure(0, weight=1)
         return tree
+
+    def _grid_tree_with_scrollbars(self, frame: ttk.Frame, tree: ttk.Treeview, *, row: int, column: int) -> None:
+        tree.grid(row=row, column=column, sticky="nsew")
+        y_scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        y_scrollbar.grid(row=row, column=column + 1, sticky="ns")
+        x_scrollbar = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        x_scrollbar.grid(row=row + 1, column=column, sticky="ew")
+        tree.configure(yscrollcommand=y_scrollbar.set, xscrollcommand=x_scrollbar.set)
 
     def start(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -871,7 +873,7 @@ class WatchDeskApp:
                     row["side"],
                     f"{float(row['price']):,.2f}",
                     f"{int(row['qty']):,}",
-                    row["status"],
+                    _order_status_label(row["status"]),
                     row["strategy_version"],
                     _optional_id(row["candidate_id"]),
                     _optional_id(row["entry_order_id"]),
@@ -1197,6 +1199,17 @@ def _stock_label(symbol: object, name: object = "") -> str:
 
 def _candidate_status_label(value: object) -> str:
     return {"active": "啟用", "inactive": "停用"}.get(str(value), str(value))
+
+
+def _order_status_label(value: object) -> str:
+    return {
+        "open": "委託中",
+        "filled": "已成交",
+        "expired": "已過期",
+        "cancelled": "已取消",
+        "canceled": "已取消",
+        "rejected": "已拒絕",
+    }.get(str(value), str(value))
 
 
 def _proposal_status_label(value: object) -> str:

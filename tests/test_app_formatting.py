@@ -1,6 +1,6 @@
 import json
 
-from tw_watchdesk.app import _display_text, _format_agent_reviews, _format_db_time, _format_json_text, _proposal_status_label
+from tw_watchdesk.app import _display_text, _format_agent_reviews, _format_db_time, _format_json_text, _order_status_label, _proposal_status_label
 
 
 def test_review_status_labels_hide_internal_review_only_code() -> None:
@@ -36,6 +36,12 @@ def test_display_text_hides_internal_review_status_codes() -> None:
 
 def test_db_time_formats_utc_iso_as_local_detail_time() -> None:
     assert _format_db_time("2026-07-03T01:10:03+00:00", "Asia/Taipei") == "2026-07-03 09:10:03"
+
+
+def test_order_status_label_uses_traditional_chinese() -> None:
+    assert _order_status_label("open") == "委託中"
+    assert _order_status_label("filled") == "已成交"
+    assert _order_status_label("expired") == "已過期"
 
 
 def test_agent_review_format_hides_internal_action_codes() -> None:
